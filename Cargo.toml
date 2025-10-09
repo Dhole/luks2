@@ -21,7 +21,7 @@ base64 = { version = "0.13", default-features = false, features = ["alloc"] }
 bincode = { version = "2.0.0-rc.3", default-features = false, features = ["alloc", "derive"] }
 crossterm = { version = "0.19", optional = true }
 hmac = "0.12.1"
-pbkdf2 = { version = "0.11.0", default_features = false }
+pbkdf2 = { version = "0.11.0", default-features = false }
 argon2 = "0.4.1"
 secrecy = "0.8"
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }

@@ -30,6 +30,12 @@ pub enum ParseError {
 
     #[error("Invalid reference in JSON: a nonexistent keyslot or segment was referenced")]
     InvalidReference,
+
+    #[error("Missing null character in C-string {0}")]
+    NoNullInCStr(&'static str),
+
+    #[error("Invalid utf8 encoding in C-string {0}: {1}")]
+    InvalidUtf8InCStr(&'static str, core::str::Utf8Error),
 }
 
 /// Enum for errors arising during interaction with a [`LuksDevice`](crate::LuksDevice).

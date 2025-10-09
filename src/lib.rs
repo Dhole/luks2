@@ -10,7 +10,6 @@
 //! the master key extraction (which happens everytime a `LuksDevice` is
 //! created) will take quite a long time.
 
-
 extern crate alloc;
 
 /// Recover information that was split antiforensically.
@@ -19,31 +18,36 @@ pub mod af;
 /// Custom error types.
 pub mod error;
 
+/// Internal utils
+mod utils;
+
 /// Password input.
 #[cfg(feature = "std")]
 pub mod password;
 
-use alloc::collections::BTreeMap;
-use alloc::{format, vec};
-use alloc::string::{String, ToString};
-use alloc::vec::Vec;
 use self::error::{LuksError, ParseError};
-use aes::{Aes128, Aes256, cipher::KeyInit};
+use acid_io::{self, Cursor, ErrorKind, Read, Seek, SeekFrom};
+use aes::{cipher::KeyInit, Aes128, Aes256};
+use alloc::collections::BTreeMap;
+use alloc::string::String;
+use alloc::vec::Vec;
+use alloc::{format, vec};
+use bincode::Decode;
+use core::{
+    cmp::max,
+    ffi::CStr,
+    fmt::{Debug, Display},
+    str::FromStr,
+};
 use hmac::Hmac;
 use secrecy::{CloneableSecret, DebugSecret, ExposeSecret, Secret, Zeroize};
 use serde::{
     de::{self, Deserializer},
     Deserialize, Serialize,
 };
-use sha2::Sha256;
 use sha1::Sha1;
-use core::{
-    cmp::max,
-    fmt::{Debug, Display},
-    str::FromStr,
-};
-use acid_io::{self, Cursor, ErrorKind, Read, Seek, SeekFrom};
-use bincode::Decode;
+use sha2::Sha256;
+use utils::{ByteStr, Bytes};
 use xts_mode::{get_tweak_default, Xts128};
 
 #[macro_use]
@@ -54,12 +58,21 @@ big_array! {
     +184, 7*512
 }
 
+const MAGIC_1ST: &[u8] = b"LUKS\xba\xbe";
+const MAGIC_2ND: &[u8] = b"SKUL\xba\xbe";
+const MAGIC_L: usize = 6;
+const UUID_L: usize = 40;
+const LABEL_L: usize = 48;
+const SALT_L: usize = 64;
+const CSUM_ALG_L: usize = 32;
+const CSUM_L: usize = 64;
+
 /// A LUKS2 header as described
 /// [here](https://gitlab.com/cryptsetup/LUKS2-docs/blob/master/luks2_doc_wip.pdf).
 #[derive(Decode, PartialEq)]
 pub struct LuksHeader {
-    /// must be "LUKS\xba\xbe" or "SKUL\xba\xbe"
-    pub magic: [u8; 6],
+    /// must be `MAGIC_1ST` or `MAGIC_2ND`
+    pub magic: [u8; MAGIC_L],
     /// Version 2
     pub version: u16,
     /// header size plus JSON area in bytes
@@ -68,18 +81,18 @@ pub struct LuksHeader {
     pub seqid: u64,
     /// ASCII label or empty
     // #[serde(with = "BigArray")]
-    pub label: [u8; 48],
+    pub label: [u8; LABEL_L],
     /// checksum algorithm, "sha256"
-    pub csum_alg: [u8; 32],
+    pub csum_alg: [u8; CSUM_ALG_L],
     /// salt, unique for every header
     // #[serde(with = "BigArray")]
-    pub salt: [u8; 64],
+    pub salt: [u8; SALT_L],
     /// UUID of device
     // #[serde(with = "BigArray")]
-    pub uuid: [u8; 40],
+    pub uuid: [u8; UUID_L],
     /// owner subsystem label or empty
     // #[serde(with = "BigArray")]
-    pub subsystem: [u8; 48],
+    pub subsystem: [u8; LABEL_L],
     /// offset from device start in bytes
     pub hdr_offset: u64,
     // must be zeroed
@@ -87,10 +100,17 @@ pub struct LuksHeader {
     _padding: [u8; 184],
     /// header checksum
     // #[serde(with = "BigArray")]
-    pub csum: [u8; 64],
+    pub csum: [u8; CSUM_L],
     // Padding, must be zeroed
     // #[serde(with = "BigArray")]
     _padding4069: [u8; 7 * 512],
+}
+
+fn parse_cstr<'a>(src: &'a [u8], name: &'static str) -> Result<&'a str, ParseError> {
+    CStr::from_bytes_until_nul(src)
+        .map_err(|_| ParseError::NoNullInCStr(name))?
+        .to_str()
+        .map_err(|utf8_error| ParseError::InvalidUtf8InCStr(name, utf8_error))
 }
 
 impl LuksHeader {
@@ -98,15 +118,15 @@ impl LuksHeader {
     ///
     /// Note: a LUKS2 header is always exactly 4096 bytes long.
     pub fn from_slice(slice: &[u8]) -> Result<Self, ParseError> {
-        let options = bincode::config::legacy().with_big_endian().with_fixed_int_encoding();
+        let options = bincode::config::legacy()
+            .with_big_endian()
+            .with_fixed_int_encoding();
         let h: Self = bincode::decode_from_slice(slice, options)?.0;
         // let h: BorrowCompat<Self> = bincode::decode_from_slice(slice, options)?.0;
         // let h = h.0;
 
         // check magic value (must be "LUKS\xba\xbe" or "SKUL\xba\xbe")
-        if (h.magic != [0x4c, 0x55, 0x4b, 0x53, 0xba, 0xbe])
-            && (h.magic != [0x53, 0x4b, 0x55, 0x4c, 0xba, 0xbe])
-        {
+        if (h.magic != MAGIC_1ST) && (h.magic != MAGIC_2ND) {
             return Err(ParseError::InvalidHeaderMagic);
         }
         // check header version
@@ -117,91 +137,49 @@ impl LuksHeader {
         Ok(h)
     }
 
-    pub fn uuid(&self) -> &str {
-        core::str::from_utf8(&self.uuid).unwrap().trim_end_matches('\x00')
+    pub fn label(&self) -> Result<&str, ParseError> {
+        parse_cstr(&self.label, "header.label")
+    }
+
+    pub fn uuid(&self) -> Result<&str, ParseError> {
+        parse_cstr(&self.uuid, "header.uuid")
     }
 }
 
 // implement manually to omit always-zero padding sections
 impl Debug for LuksHeader {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(
-            f,
-            "{}",
-            format!(
-                "LuksHeader {{ magic: {:?}, version: {:?}, hdr_size: {:?}, seqid: {:?}, \
-			label: {:?}, csum_alg: {:?}, salt: {:?}, uuid: {:?}, subsystem: {:?}, \
-			hdr_offset: {:?}, csum: {:?} }}",
-                self.magic,
-                self.version,
-                self.hdr_size,
-                self.seqid,
-                self.label,
-                self.csum_alg,
-                self.salt,
-                self.uuid,
-                self.subsystem,
-                self.hdr_offset,
-                self.csum
-            )
-        )
+        f.debug_struct("LuksHeader")
+            .field("magic", &ByteStr(&self.magic))
+            .field("version", &self.version)
+            .field("hdr_size", &self.hdr_size)
+            .field("seqid", &self.seqid)
+            .field("label", &ByteStr(&self.label))
+            .field("csum_alg", &ByteStr(&self.csum_alg))
+            .field("salt", &Bytes(&self.salt))
+            .field("uuid", &ByteStr(&self.uuid))
+            .field("subsystem", &ByteStr(&self.subsystem))
+            .field("hdr_offset", &self.hdr_offset)
+            .field("csum", &Bytes(&self.csum))
+            .finish()
     }
 }
 
 impl Display for LuksHeader {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        fn bytes_to_str<'a>(empty_text: &'static str, bytes: &'a [u8]) -> &'a str {
-            if bytes.iter().all(|el| *el == 0) {
-                empty_text
-            } else {
-                match core::str::from_utf8(bytes) {
-                    Ok(s) => s,
-                    Err(_) => "<decoding error>",
-                }
-            }
-        }
-
-        fn bytes_to_hex_string(bytes: &[u8]) -> String {
-            let mut s = String::with_capacity(bytes.len());
-            for b in bytes {
-                s += format!("{:02X}", b).as_str()
-            }
-            s
-        }
-
-        let mut magic = String::from_utf8_lossy(&self.magic[..4]).to_string();
-        magic += format!("\\x{:x}\\x{:x}", self.magic[4], self.magic[5]).as_str();
-
-        write!(
-            f,
-            "{}",
-            format!(
-                "LuksHeader {{\n\
-			\tmagic: {},\n\
-			\tversion: {},\n\
-			\theader size: {},\n\
-			\tsequence id: {},\n\
-			\tlabel: {},\n\
-			\tchecksum algorithm: {},\n\
-			\tsalt: {},\n\
-			\tuuid: {},\n\
-			\tsubsystem label: {},\n\
-			\theader offset: {},\n\
-			\tchecksum: {}\n\
-			}}",
-                magic,
-                self.version,
-                self.hdr_size,
-                self.seqid,
-                bytes_to_str("<no label>", &self.label),
-                bytes_to_str("<no checksum algorithm>", &self.csum_alg),
-                bytes_to_hex_string(&self.salt),
-                bytes_to_str("<no uuid>", &self.uuid),
-                bytes_to_str("<no subsystem label>", &self.subsystem),
-                self.hdr_offset,
-                bytes_to_hex_string(&self.csum)
-            )
-        )
+        writeln!(f, "LuksHeader:")?;
+        writeln!(f, "\tmagic: {}", &ByteStr(&self.magic))?;
+        writeln!(f, "\tversion: {}", &self.version)?;
+        writeln!(f, "\thdr_size: {}", &self.hdr_size)?;
+        writeln!(f, "\tseqid: {}", &self.seqid)?;
+        writeln!(f, "\tlabel: {}", &ByteStr(&self.label))?;
+        writeln!(f, "\tcsum_alg: {}", &ByteStr(&self.csum_alg))?;
+        writeln!(f, "\tsalt: {:?}", &Bytes(&self.salt))?;
+        writeln!(f, "\tuuid: {}", &ByteStr(&self.uuid))?;
+        writeln!(f, "\tsubsystem: {}", &ByteStr(&self.subsystem))?;
+        writeln!(f, "\thdr_offset: 0x{:016x}", &self.hdr_offset)?;
+        writeln!(f, "\tcsum: {:?}", &Bytes(&self.csum))?;
+        Ok(())
     }
 }
 
@@ -773,11 +751,7 @@ enum PasswordOrMasterKey<'a> {
 }
 
 impl<T: Read + Seek> LuksDevice<T> {
-    pub fn from_device(
-        device: T,
-        password: &[u8],
-        sector_size: usize,
-    ) -> Result<Self, LuksError> {
+    pub fn from_device(device: T, password: &[u8], sector_size: usize) -> Result<Self, LuksError> {
         Self::from_device_internal(device, PasswordOrMasterKey::Password(password), sector_size)
     }
     /// Creates a `LuksDevice` from a device (i. e. any type that implements [`Read`] and [`Seek`]).
@@ -788,7 +762,11 @@ impl<T: Read + Seek> LuksDevice<T> {
         master_key: SecretMasterKey,
         sector_size: usize,
     ) -> Result<Self, LuksError> {
-        Self::from_device_internal(device, PasswordOrMasterKey::MasterKey(master_key), sector_size)
+        Self::from_device_internal(
+            device,
+            PasswordOrMasterKey::MasterKey(master_key),
+            sector_size,
+        )
     }
     fn from_device_internal(
         mut device: T,
@@ -807,7 +785,9 @@ impl<T: Read + Seek> LuksDevice<T> {
         let json = LuksJson::from_slice(&j)?;
 
         let master_key = match password_or_master_key {
-            PasswordOrMasterKey::Password(password) => Self::decrypt_master_key(password, &json, &mut device, sector_size)?,
+            PasswordOrMasterKey::Password(password) => {
+                Self::decrypt_master_key(password, &json, &mut device, sector_size)?
+            }
             PasswordOrMasterKey::MasterKey(master_key) => master_key,
         };
         let active_segment = json.segments[&0].clone();
@@ -912,7 +892,8 @@ impl<T: Read + Seek> LuksDevice<T> {
                 } else {
                     argon2::Algorithm::Argon2id
                 };
-                let params = argon2::Params::new(*memory, *time, *cpus, Some(area.key_size() as usize))?;
+                let params =
+                    argon2::Params::new(*memory, *time, *cpus, Some(area.key_size() as usize))?;
                 let argon = argon2::Argon2::new(algorithm, argon2::Version::V0x13, params);
                 let salt = base64::decode(salt)?;
                 argon.hash_password_into(password, &salt, &mut pw_hash)?;
@@ -965,7 +946,11 @@ impl<T: Read + Seek> LuksDevice<T> {
         let hash_fn = match json.digests[&0].hash().as_str() {
             "sha256" => pbkdf2::pbkdf2::<Hmac<Sha256>>,
             "sha1" => pbkdf2::pbkdf2::<Hmac<Sha1>>,
-            _ => return Err(LuksError::UnsupportedDigestHash(json.digests[&0].hash().clone())),
+            _ => {
+                return Err(LuksError::UnsupportedDigestHash(
+                    json.digests[&0].hash().clone(),
+                ))
+            }
         };
         hash_fn(
             &master_key.expose_secret().0,
@@ -998,7 +983,8 @@ impl<T: Read + Seek> LuksDevice<T> {
         }
 
         let sector_size = self.active_segment.sector_size() as u64;
-        let mut max_sector = (self.active_segment_size()? + self.active_segment.offset()) / sector_size;
+        let mut max_sector =
+            (self.active_segment_size()? + self.active_segment.offset()) / sector_size;
         if (self.active_segment_size()? % sector_size) != 0 {
             max_sector += 1;
         }
