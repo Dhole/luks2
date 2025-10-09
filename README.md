@@ -9,6 +9,7 @@ available on your platform).
 
 ## Changes compared to original
 
+From https://github.com/oberien/luks2
 * fix a bug where decryption fails due to an invalid iv when the sector_size is not 512
 * add no_std support
 * fix a bug where the final 16MB (segment-offset) of a segment weren't read
@@ -18,6 +19,7 @@ available on your platform).
 * fix a bug where decryption fails if keyslot and segmentslot aren't equal
 * add sha1 support
 
+From https://github.com/Dhole/luks2
 * run `cargo fmt`
 * simplify `LuksHeader` `Display` & `Debug`
 * implement header checksum verification
