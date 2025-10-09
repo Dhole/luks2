@@ -1,3 +1,5 @@
+use crate::utils::{ByteStr, Bytes};
+use crate::{CSUM_ALG_LEN, CSUM_LEN};
 use alloc::string::String;
 use thiserror_no_std::Error;
 
@@ -36,6 +38,15 @@ pub enum ParseError {
 
     #[error("Invalid utf8 encoding in C-string {0}: {1}")]
     InvalidUtf8InCStr(&'static str, core::str::Utf8Error),
+
+    #[error("Invalid checksum: calculated={:?}, found={:?}", &Bytes(.calculated), &Bytes(.found))]
+    InvalidChecksum {
+        calculated: [u8; CSUM_LEN],
+        found: [u8; CSUM_LEN],
+    },
+
+    #[error("Unsupported checksum algorithm {}", &ByteStr(.0))]
+    UnsupportedChecksumAlgorithm([u8; CSUM_ALG_LEN]),
 }
 
 /// Enum for errors arising during interaction with a [`LuksDevice`](crate::LuksDevice).

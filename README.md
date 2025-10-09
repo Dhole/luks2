@@ -17,3 +17,7 @@ available on your platform).
 * allow opening a `LuksDevice` with an existing `SecretMasterKey`
 * fix a bug where decryption fails if keyslot and segmentslot aren't equal
 * add sha1 support
+
+* run `cargo fmt`
+* simplify `LuksHeader` `Display` & `Debug`
+* implement header checksum verification

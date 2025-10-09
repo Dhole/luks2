@@ -32,7 +32,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::{format, vec};
-use bincode::Decode;
+use bincode::{Decode, Encode};
 use core::{
     cmp::max,
     ffi::CStr,
@@ -46,7 +46,7 @@ use serde::{
     Deserialize, Serialize,
 };
 use sha1::Sha1;
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use utils::{ByteStr, Bytes};
 use xts_mode::{get_tweak_default, Xts128};
 
@@ -58,21 +58,22 @@ big_array! {
     +184, 7*512
 }
 
-const MAGIC_1ST: &[u8] = b"LUKS\xba\xbe";
-const MAGIC_2ND: &[u8] = b"SKUL\xba\xbe";
-const MAGIC_L: usize = 6;
-const UUID_L: usize = 40;
-const LABEL_L: usize = 48;
-const SALT_L: usize = 64;
-const CSUM_ALG_L: usize = 32;
-const CSUM_L: usize = 64;
+pub(crate) const MAGIC_1ST: &[u8] = b"LUKS\xba\xbe";
+pub(crate) const MAGIC_2ND: &[u8] = b"SKUL\xba\xbe";
+pub(crate) const MAGIC_LEN: usize = 6;
+pub(crate) const UUID_LEN: usize = 40;
+pub(crate) const LABEL_LEN: usize = 48;
+pub(crate) const SALT_LEN: usize = 64;
+pub(crate) const CSUM_ALG_LEN: usize = 32;
+pub(crate) const CSUM_LEN: usize = 64;
+pub(crate) const LUKS_BIN_HEADER_LEN: usize = 4096;
 
 /// A LUKS2 header as described
 /// [here](https://gitlab.com/cryptsetup/LUKS2-docs/blob/master/luks2_doc_wip.pdf).
-#[derive(Decode, PartialEq)]
-pub struct LuksHeader {
+#[derive(Clone, Encode, Decode, PartialEq)]
+pub struct LuksBinHeader {
     /// must be `MAGIC_1ST` or `MAGIC_2ND`
-    pub magic: [u8; MAGIC_L],
+    pub magic: [u8; MAGIC_LEN],
     /// Version 2
     pub version: u16,
     /// header size plus JSON area in bytes
@@ -81,18 +82,18 @@ pub struct LuksHeader {
     pub seqid: u64,
     /// ASCII label or empty
     // #[serde(with = "BigArray")]
-    pub label: [u8; LABEL_L],
+    pub label: [u8; LABEL_LEN],
     /// checksum algorithm, "sha256"
-    pub csum_alg: [u8; CSUM_ALG_L],
+    pub csum_alg: [u8; CSUM_ALG_LEN],
     /// salt, unique for every header
     // #[serde(with = "BigArray")]
-    pub salt: [u8; SALT_L],
+    pub salt: [u8; SALT_LEN],
     /// UUID of device
     // #[serde(with = "BigArray")]
-    pub uuid: [u8; UUID_L],
+    pub uuid: [u8; UUID_LEN],
     /// owner subsystem label or empty
     // #[serde(with = "BigArray")]
-    pub subsystem: [u8; LABEL_L],
+    pub subsystem: [u8; LABEL_LEN],
     /// offset from device start in bytes
     pub hdr_offset: u64,
     // must be zeroed
@@ -100,7 +101,7 @@ pub struct LuksHeader {
     _padding: [u8; 184],
     /// header checksum
     // #[serde(with = "BigArray")]
-    pub csum: [u8; CSUM_L],
+    pub csum: [u8; CSUM_LEN],
     // Padding, must be zeroed
     // #[serde(with = "BigArray")]
     _padding4069: [u8; 7 * 512],
@@ -113,7 +114,7 @@ fn parse_cstr<'a>(src: &'a [u8], name: &'static str) -> Result<&'a str, ParseErr
         .map_err(|utf8_error| ParseError::InvalidUtf8InCStr(name, utf8_error))
 }
 
-impl LuksHeader {
+impl LuksBinHeader {
     /// Attempt to read a LUKS2 header from a reader.
     ///
     /// Note: a LUKS2 header is always exactly 4096 bytes long.
@@ -137,6 +138,13 @@ impl LuksHeader {
         Ok(h)
     }
 
+    pub fn write_slice(&self, slice: &mut [u8]) -> Result<(), bincode::error::EncodeError> {
+        let options = bincode::config::legacy()
+            .with_big_endian()
+            .with_fixed_int_encoding();
+        bincode::encode_into_slice(self, slice, options).map(|_| ())
+    }
+
     pub fn label(&self) -> Result<&str, ParseError> {
         parse_cstr(&self.label, "header.label")
     }
@@ -144,10 +152,14 @@ impl LuksHeader {
     pub fn uuid(&self) -> Result<&str, ParseError> {
         parse_cstr(&self.uuid, "header.uuid")
     }
+
+    pub fn verify_checksum(&self) -> Result<(), ParseError> {
+        todo!()
+    }
 }
 
 // implement manually to omit always-zero padding sections
-impl Debug for LuksHeader {
+impl Debug for LuksBinHeader {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LuksHeader")
             .field("magic", &ByteStr(&self.magic))
@@ -165,7 +177,7 @@ impl Debug for LuksHeader {
     }
 }
 
-impl Display for LuksHeader {
+impl Display for LuksBinHeader {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         writeln!(f, "LuksHeader:")?;
         writeln!(f, "\tmagic: {}", &ByteStr(&self.magic))?;
@@ -180,6 +192,69 @@ impl Display for LuksHeader {
         writeln!(f, "\thdr_offset: 0x{:016x}", &self.hdr_offset)?;
         writeln!(f, "\tcsum: {:?}", &Bytes(&self.csum))?;
         Ok(())
+    }
+}
+
+pub struct LuksHeader {
+    bin: LuksBinHeader,
+    json: LuksJson,
+}
+
+impl LuksHeader {
+    pub fn from_reader<R: Read>(mut r: R) -> Result<Self, LuksError> {
+        let mut bin_header_bytes = vec![0; LUKS_BIN_HEADER_LEN];
+        r.read_exact(&mut bin_header_bytes)?;
+        let bin_header = LuksBinHeader::from_slice(&bin_header_bytes)?;
+        let mut json_area_bytes = vec![0; bin_header.hdr_size as usize - LUKS_BIN_HEADER_LEN];
+        r.read_exact(&mut json_area_bytes)?;
+        Self::verify_checksum(&bin_header, &json_area_bytes)?;
+        let json_area_str = parse_cstr(&json_area_bytes, "json_area")?;
+        let json_area = LuksJson::from_slice(&json_area_str.as_bytes())?;
+        Ok(Self {
+            bin: bin_header,
+            json: json_area,
+        })
+    }
+
+    fn verify_checksum_generic<H: Digest>(
+        bin_header: &LuksBinHeader,
+        json_area_bytes: &[u8],
+    ) -> Result<(), ParseError> {
+        let csum = bin_header.csum;
+        let mut bin_header = bin_header.clone();
+        bin_header.csum = [0; CSUM_LEN];
+        let mut bin_header_bytes = vec![0; LUKS_BIN_HEADER_LEN];
+        bin_header
+            .write_slice(&mut bin_header_bytes)
+            .expect("bincode encode");
+
+        let mut hasher = H::new();
+        hasher.update(bin_header_bytes);
+        hasher.update(json_area_bytes);
+        let result = hasher.finalize();
+        let mut calculated = [0; CSUM_LEN];
+        calculated[..result.len()].copy_from_slice(&result);
+        if calculated != csum {
+            Err(ParseError::InvalidChecksum {
+                calculated,
+                found: csum,
+            })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn verify_checksum(
+        bin_header: &LuksBinHeader,
+        json_area_bytes: &[u8],
+    ) -> Result<(), ParseError> {
+        if bin_header.csum_alg.starts_with(b"sha256\0") {
+            Self::verify_checksum_generic::<Sha256>(&bin_header, json_area_bytes)
+        } else {
+            Err(ParseError::UnsupportedChecksumAlgorithm(
+                bin_header.csum_alg,
+            ))
+        }
     }
 }
 
@@ -734,7 +809,7 @@ pub struct LuksDevice<T: Read + Seek> {
     current_sector: Cursor<Vec<u8>>,
     current_sector_num: u64,
     /// The header read from the device.
-    pub header: LuksHeader,
+    pub header: LuksBinHeader,
     /// The JSON section read from the device.
     pub json: LuksJson,
     /// The sector size of the device.
@@ -776,7 +851,7 @@ impl<T: Read + Seek> LuksDevice<T> {
         // read and parse LuksHeader
         let mut h = vec![0; 4096];
         device.read_exact(&mut h)?;
-        let header = LuksHeader::from_slice(&h)?;
+        let header = LuksBinHeader::from_slice(&h)?;
 
         // read and parse LuksJson
         let mut j = vec![0; (header.hdr_size - 4096) as usize];
