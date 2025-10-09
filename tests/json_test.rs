@@ -61,7 +61,7 @@ fn parse_json() {
             size: LuksSegmentSize::dynamic,
             iv_tweak: 0,
             encryption: String::from("aes-xts-plain64"),
-            sector_size: 51266,
+            sector_size: 4096,
             integrity: None,
             flags: None,
         },
