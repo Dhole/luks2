@@ -1,8 +1,9 @@
 #!/bin/sh
 set -ex
 
-fallocate -l 16M tests/test.iso
-printf "YES\npassword\npassword" | cryptsetup luksFormat \
-    --force-password \
-    --type luks2 \
-    tests/test.iso
+dd if=/dev/zero bs=1M count=20 > tests/test.iso
+printf "password" | cryptsetup luksFormat \
+    --pbkdf-force-iterations=4 \
+    --pbkdf-memory=32 \
+    tests/test.iso \
+    --key-file -
