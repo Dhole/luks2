@@ -43,11 +43,8 @@ pub enum ParseError {
     #[error("Invalid reference in JSON: a nonexistent keyslot or segment was referenced")]
     InvalidReference,
 
-    #[error("Missing null character in C-string {0}")]
-    NoNullInCStr(&'static str),
-
-    #[error("Invalid utf8 encoding in C-string {0}: {1}")]
-    InvalidUtf8InCStr(&'static str, core::str::Utf8Error),
+    #[error("Missing null character in C-string {ctx}")]
+    NoNullInCStr { ctx: &'static str },
 
     #[error("Invalid checksum: calculated={:?}, found={:?}", &Bytes(.calculated), &Bytes(.found))]
     InvalidChecksum {

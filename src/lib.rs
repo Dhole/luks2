@@ -33,12 +33,14 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::{format, vec};
 use bincode::{Decode, Encode};
+use core::convert::TryFrom;
 use core::{
     cmp::max,
     ffi::CStr,
     fmt::{Debug, Display},
     str::FromStr,
 };
+use crypto_common::Output;
 use hmac::Hmac;
 use secrecy::{CloneableSecret, DebugSecret, ExposeSecret, Secret, Zeroize};
 use serde::{
@@ -47,7 +49,6 @@ use serde::{
 };
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
-use std::convert::TryFrom;
 use utils::{ByteStr, Bytes};
 use xts_mode::{get_tweak_default, Xts128};
 
@@ -68,14 +69,16 @@ pub(crate) const SALT_LEN: usize = 64;
 pub(crate) const CSUM_ALG_LEN: usize = 32;
 pub(crate) const CSUM_LEN: usize = 64;
 pub(crate) const LUKS_BIN_HEADER_LEN: usize = 4096;
+pub(crate) const CSUM_ALG_SHA256: &[u8] = b"sha256\0";
 
+#[derive(Debug, Clone)]
 pub enum Magic {
     First,
     Second,
 }
 
 impl Magic {
-    pub fn as_byte_array(&self) -> [u8; MAGIC_LEN] {
+    pub fn to_byte_array(&self) -> [u8; MAGIC_LEN] {
         let mut array = [0; MAGIC_LEN];
         array.copy_from_slice(match self {
             Self::First => MAGIC_1ST,
@@ -94,30 +97,38 @@ impl Magic {
     }
 }
 
-pub enum ChecksumAlg {
-    Sha256,
+// TODO: Checksum enum with value
+#[derive(Debug, Clone)]
+pub enum Checksum {
+    Sha256(Output<Sha256>),
 }
 
-impl ChecksumAlg {
-    pub fn as_byte_str(&self) -> &'static [u8] {
+impl Display for Checksum {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Sha256 => b"sha256",
+            Self::Sha256(csum) => write!(f, "sha256:{:?}", &Bytes(csum.as_slice())),
         }
     }
-    pub fn from_byte_str(s: &[u8]) -> Option<Self> {
-        if s == b"sha256" {
-            Some(Self::Sha256)
+}
+
+impl Checksum {
+    pub fn to_byte_arrays(&self) -> ([u8; CSUM_ALG_LEN], [u8; CSUM_LEN]) {
+        let (s_csum_alg, s_csum) = match self {
+            Self::Sha256(csum) => (CSUM_ALG_SHA256, csum.as_slice()),
+        };
+        let mut csum_alg = [0; CSUM_ALG_LEN];
+        let mut csum = [0; CSUM_LEN];
+        csum_alg[..s_csum_alg.len()].copy_from_slice(s_csum_alg);
+        csum[..s_csum.len()].copy_from_slice(s_csum);
+        (csum_alg, csum)
+    }
+    pub fn from_byte_arrays(csum_alg: &[u8; CSUM_ALG_LEN], csum: &[u8; CSUM_LEN]) -> Option<Self> {
+        if csum_alg.starts_with(CSUM_ALG_SHA256) {
+            Some(Self::Sha256(*Output::<Sha256>::from_slice(&csum[..32])))
         } else {
             None
         }
     }
-}
-
-fn byte_str_to_array<const N: usize>(s: &'static [u8]) -> [u8; N] {
-    assert!(s.len() < N);
-    let mut array = [0; N];
-    array[..s.len()].copy_from_slice(s);
-    array
 }
 
 fn str_to_ascii_array<const N: usize>(ctx: &'static str, s: &str) -> Result<[u8; N], EncodeError> {
@@ -125,7 +136,7 @@ fn str_to_ascii_array<const N: usize>(ctx: &'static str, s: &str) -> Result<[u8;
         return Err(EncodeError::StringNotAscii { ctx });
     }
     let byte_str = s.as_bytes();
-    if byte_str.len() < N {
+    if !(byte_str.len() < N) {
         return Err(EncodeError::StringTooLong { ctx, n: N });
     }
     let mut array = [0; N];
@@ -133,20 +144,22 @@ fn str_to_ascii_array<const N: usize>(ctx: &'static str, s: &str) -> Result<[u8;
     Ok(array)
 }
 
-fn ascii_byte_str_to_string(ctx: &'static str, s: &[u8]) -> Result<Option<String>, ParseError> {
+fn ascii_cstr_to_str<'a>(ctx: &'static str, s: &'a [u8]) -> Result<&'a str, ParseError> {
     if !s.is_ascii() {
         return Err(ParseError::StringNotAscii { ctx });
     }
-    if s[0] == 0 {
-        Ok(None)
-    } else {
-        Ok(Some(
-            std::str::from_utf8(s).expect("ascii in UTF-8").to_string(),
-        ))
-    }
+    Ok(CStr::from_bytes_until_nul(s)
+        .map_err(|_| ParseError::NoNullInCStr { ctx })?
+        .to_str()
+        .expect("ascii is subset of UTF-8"))
 }
 
-pub struct LuksBinHeader2 {
+fn ascii_cstr_to_string(ctx: &'static str, s: &[u8]) -> Result<Option<String>, ParseError> {
+    ascii_cstr_to_str(ctx, s).map(|s| if s == "" { None } else { Some(s.to_string()) })
+}
+
+#[derive(Debug, Clone)]
+pub struct LuksBinHeader {
     pub magic: Magic,
     /// header size plus JSON area in bytes
     pub hdr_size: u64,
@@ -154,8 +167,7 @@ pub struct LuksBinHeader2 {
     pub seqid: u64,
     /// ASCII label or empty
     pub label: Option<String>,
-    /// checksum algorithm
-    pub csum_alg: ChecksumAlg,
+    pub checksum: Checksum,
     /// salt, unique for every header
     pub salt: [u8; SALT_LEN],
     /// UUID of device
@@ -164,37 +176,53 @@ pub struct LuksBinHeader2 {
     pub subsystem: Option<String>,
     /// offset from device start in bytes
     pub hdr_offset: u64,
-    /// header checksum
-    pub csum: [u8; CSUM_LEN],
 }
 
-impl TryFrom<&LuksBinHeader2> for LuksBinHeader {
+impl Display for LuksBinHeader {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        writeln!(f, "LuksBinHeader:")?;
+        writeln!(f, "\tlocation: {:?}", self.magic)?;
+        writeln!(f, "\tversion: 2")?;
+        writeln!(f, "\thdr_size: {}", self.hdr_size)?;
+        writeln!(f, "\tseqid: {}", self.seqid)?;
+        writeln!(f, "\tlabel: {:?}", self.label)?;
+        writeln!(f, "\tchecksum: {}", self.checksum)?;
+        writeln!(f, "\tsalt: {:?}", &Bytes(&self.salt))?;
+        writeln!(f, "\tuuid: {}", self.uuid)?;
+        writeln!(f, "\tsubsystem: {:?}", self.subsystem)?;
+        writeln!(f, "\thdr_offset: 0x{:016x}", self.hdr_offset)?;
+        Ok(())
+    }
+}
+
+impl TryFrom<&LuksBinHeader> for LuksBinHeaderRaw {
     type Error = EncodeError;
-    fn try_from(h: &LuksBinHeader2) -> Result<Self, Self::Error> {
+    fn try_from(h: &LuksBinHeader) -> Result<Self, Self::Error> {
         fn opt_string_to_str(s: &Option<String>) -> &str {
             s.as_ref().map(|s| s.as_str()).unwrap_or("")
         }
+        let (csum_alg, csum) = h.checksum.to_byte_arrays();
         Ok(Self {
-            magic: h.magic.as_byte_array(),
+            magic: h.magic.to_byte_array(),
             version: 2,
             hdr_size: h.hdr_size,
             seqid: h.seqid,
             label: str_to_ascii_array("BinHeader.label", opt_string_to_str(&h.label))?,
-            csum_alg: byte_str_to_array(h.csum_alg.as_byte_str()),
+            csum_alg,
             salt: h.salt,
             uuid: str_to_ascii_array("BinHeader.uuid", &h.uuid)?,
             subsystem: str_to_ascii_array("BinHeader.subsystem", opt_string_to_str(&h.subsystem))?,
             hdr_offset: h.hdr_offset,
             _padding: [0; 184],
-            csum: h.csum,
+            csum,
             _padding4069: [0; 7 * 512],
         })
     }
 }
 
-impl TryFrom<&LuksBinHeader> for LuksBinHeader2 {
+impl TryFrom<&LuksBinHeaderRaw> for LuksBinHeader {
     type Error = ParseError;
-    fn try_from(h: &LuksBinHeader) -> Result<Self, Self::Error> {
+    fn try_from(h: &LuksBinHeaderRaw) -> Result<Self, Self::Error> {
         // check header version
         if h.version != 2 {
             return Err(ParseError::InvalidHeaderVersion(h.version));
@@ -203,15 +231,14 @@ impl TryFrom<&LuksBinHeader> for LuksBinHeader2 {
             magic: Magic::from_byte_array(&h.magic).ok_or(ParseError::InvalidHeaderMagic)?,
             hdr_size: h.hdr_size,
             seqid: h.seqid,
-            label: ascii_byte_str_to_string("BinHeader.label", &h.label)?,
-            csum_alg: ChecksumAlg::from_byte_str(&h.csum_alg)
+            label: ascii_cstr_to_string("BinHeader.label", &h.label)?,
+            checksum: Checksum::from_byte_arrays(&h.csum_alg, &h.csum)
                 .ok_or(ParseError::UnsupportedChecksumAlgorithm(h.csum_alg))?,
             salt: h.salt,
-            uuid: ascii_byte_str_to_string("BinHeader.uuid", &h.subsystem)?
+            uuid: ascii_cstr_to_string("BinHeader.uuid", &h.uuid)?
                 .ok_or(ParseError::MissingUuid)?,
-            subsystem: ascii_byte_str_to_string("BinHeader.subsystem", &h.subsystem)?,
+            subsystem: ascii_cstr_to_string("BinHeader.subsystem", &h.subsystem)?,
             hdr_offset: h.hdr_offset,
-            csum: h.csum,
         })
     }
 }
@@ -219,7 +246,7 @@ impl TryFrom<&LuksBinHeader> for LuksBinHeader2 {
 /// A LUKS2 header as described
 /// [here](https://gitlab.com/cryptsetup/LUKS2-docs/blob/master/luks2_doc_wip.pdf).
 #[derive(Clone, Encode, Decode, PartialEq)]
-pub struct LuksBinHeader {
+pub struct LuksBinHeaderRaw {
     /// must be `MAGIC_1ST` or `MAGIC_2ND`
     pub magic: [u8; MAGIC_LEN],
     /// Version 2
@@ -255,14 +282,7 @@ pub struct LuksBinHeader {
     _padding4069: [u8; 7 * 512],
 }
 
-fn parse_cstr<'a>(src: &'a [u8], name: &'static str) -> Result<&'a str, ParseError> {
-    CStr::from_bytes_until_nul(src)
-        .map_err(|_| ParseError::NoNullInCStr(name))?
-        .to_str()
-        .map_err(|utf8_error| ParseError::InvalidUtf8InCStr(name, utf8_error))
-}
-
-impl LuksBinHeader {
+impl LuksBinHeaderRaw {
     /// Attempt to read a LUKS2 header from a reader.
     ///
     /// Note: a LUKS2 header is always exactly 4096 bytes long.
@@ -293,23 +313,15 @@ impl LuksBinHeader {
         bincode::encode_into_slice(self, slice, options).map(|_| ())
     }
 
-    pub fn label(&self) -> Result<&str, ParseError> {
-        parse_cstr(&self.label, "header.label")
-    }
-
-    pub fn uuid(&self) -> Result<&str, ParseError> {
-        parse_cstr(&self.uuid, "header.uuid")
-    }
-
     pub fn verify_checksum(&self) -> Result<(), ParseError> {
         todo!()
     }
 }
 
 // implement manually to omit always-zero padding sections
-impl Debug for LuksBinHeader {
+impl Debug for LuksBinHeaderRaw {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("LuksHeader")
+        f.debug_struct("LuksBinHeader")
             .field("magic", &ByteStr(&self.magic))
             .field("version", &self.version)
             .field("hdr_size", &self.hdr_size)
@@ -325,24 +337,6 @@ impl Debug for LuksBinHeader {
     }
 }
 
-impl Display for LuksBinHeader {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        writeln!(f, "LuksHeader:")?;
-        writeln!(f, "\tmagic: {}", &ByteStr(&self.magic))?;
-        writeln!(f, "\tversion: {}", &self.version)?;
-        writeln!(f, "\thdr_size: {}", &self.hdr_size)?;
-        writeln!(f, "\tseqid: {}", &self.seqid)?;
-        writeln!(f, "\tlabel: {}", &ByteStr(&self.label))?;
-        writeln!(f, "\tcsum_alg: {}", &ByteStr(&self.csum_alg))?;
-        writeln!(f, "\tsalt: {:?}", &Bytes(&self.salt))?;
-        writeln!(f, "\tuuid: {}", &ByteStr(&self.uuid))?;
-        writeln!(f, "\tsubsystem: {}", &ByteStr(&self.subsystem))?;
-        writeln!(f, "\thdr_offset: 0x{:016x}", &self.hdr_offset)?;
-        writeln!(f, "\tcsum: {:?}", &Bytes(&self.csum))?;
-        Ok(())
-    }
-}
-
 pub struct LuksHeader {
     bin: LuksBinHeader,
     json: LuksJson,
@@ -352,11 +346,12 @@ impl LuksHeader {
     pub fn from_reader<R: Read>(mut r: R) -> Result<Self, LuksError> {
         let mut bin_header_bytes = vec![0; LUKS_BIN_HEADER_LEN];
         r.read_exact(&mut bin_header_bytes)?;
-        let bin_header = LuksBinHeader::from_slice(&bin_header_bytes)?;
+        let bin_header_raw = LuksBinHeaderRaw::from_slice(&bin_header_bytes)?;
+        let bin_header = LuksBinHeader::try_from(&bin_header_raw)?;
         let mut json_area_bytes = vec![0; bin_header.hdr_size as usize - LUKS_BIN_HEADER_LEN];
         r.read_exact(&mut json_area_bytes)?;
         Self::verify_checksum(&bin_header, &json_area_bytes)?;
-        let json_area_str = parse_cstr(&json_area_bytes, "json_area")?;
+        let json_area_str = ascii_cstr_to_str("json_area", &json_area_bytes)?;
         let json_area = LuksJson::from_slice(&json_area_str.as_bytes())?;
         Ok(Self {
             bin: bin_header,
@@ -365,14 +360,14 @@ impl LuksHeader {
     }
 
     fn verify_checksum_generic<H: Digest>(
+        csum: &Output<H>,
         bin_header: &LuksBinHeader,
         json_area_bytes: &[u8],
     ) -> Result<(), ParseError> {
-        let csum = bin_header.csum;
-        let mut bin_header = bin_header.clone();
-        bin_header.csum = [0; CSUM_LEN];
+        let mut bin_header_raw = LuksBinHeaderRaw::try_from(bin_header).expect("valid roundtrip");
+        bin_header_raw.csum = [0; CSUM_LEN];
         let mut bin_header_bytes = vec![0; LUKS_BIN_HEADER_LEN];
-        bin_header
+        bin_header_raw
             .write_slice(&mut bin_header_bytes)
             .expect("bincode encode");
 
@@ -380,13 +375,11 @@ impl LuksHeader {
         hasher.update(bin_header_bytes);
         hasher.update(json_area_bytes);
         let result = hasher.finalize();
-        let mut calculated = [0; CSUM_LEN];
-        calculated[..result.len()].copy_from_slice(&result);
-        if calculated != csum {
-            Err(ParseError::InvalidChecksum {
-                calculated,
-                found: csum,
-            })
+        if &result != csum {
+            let (mut calculated, mut found) = ([0; CSUM_LEN], [0; CSUM_LEN]);
+            calculated[..result.len()].copy_from_slice(&result);
+            found[..csum.len()].copy_from_slice(&csum);
+            Err(ParseError::InvalidChecksum { calculated, found })
         } else {
             Ok(())
         }
@@ -396,12 +389,10 @@ impl LuksHeader {
         bin_header: &LuksBinHeader,
         json_area_bytes: &[u8],
     ) -> Result<(), ParseError> {
-        if bin_header.csum_alg.starts_with(b"sha256\0") {
-            Self::verify_checksum_generic::<Sha256>(&bin_header, json_area_bytes)
-        } else {
-            Err(ParseError::UnsupportedChecksumAlgorithm(
-                bin_header.csum_alg,
-            ))
+        match bin_header.checksum {
+            Checksum::Sha256(ref csum) => {
+                Self::verify_checksum_generic::<Sha256>(csum, &bin_header, json_area_bytes)
+            }
         }
     }
 }
@@ -957,7 +948,7 @@ pub struct LuksDevice<T: Read + Seek> {
     current_sector: Cursor<Vec<u8>>,
     current_sector_num: u64,
     /// The header read from the device.
-    pub header: LuksBinHeader,
+    pub header: LuksBinHeaderRaw,
     /// The JSON section read from the device.
     pub json: LuksJson,
     /// The sector size of the device.
@@ -999,7 +990,7 @@ impl<T: Read + Seek> LuksDevice<T> {
         // read and parse LuksHeader
         let mut h = vec![0; 4096];
         device.read_exact(&mut h)?;
-        let header = LuksBinHeader::from_slice(&h)?;
+        let header = LuksBinHeaderRaw::from_slice(&h)?;
 
         // read and parse LuksJson
         let mut j = vec![0; (header.hdr_size - 4096) as usize];
