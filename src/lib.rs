@@ -25,7 +25,7 @@ mod utils;
 #[cfg(feature = "std")]
 pub mod password;
 
-use self::error::{LuksError, ParseError};
+use self::error::{EncodeError, LuksError, ParseError};
 use acid_io::{self, Cursor, ErrorKind, Read, Seek, SeekFrom};
 use aes::{cipher::KeyInit, Aes128, Aes256};
 use alloc::collections::BTreeMap;
@@ -47,6 +47,7 @@ use serde::{
 };
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
+use std::convert::TryFrom;
 use utils::{ByteStr, Bytes};
 use xts_mode::{get_tweak_default, Xts128};
 
@@ -67,6 +68,153 @@ pub(crate) const SALT_LEN: usize = 64;
 pub(crate) const CSUM_ALG_LEN: usize = 32;
 pub(crate) const CSUM_LEN: usize = 64;
 pub(crate) const LUKS_BIN_HEADER_LEN: usize = 4096;
+
+pub enum Magic {
+    First,
+    Second,
+}
+
+impl Magic {
+    pub fn as_byte_array(&self) -> [u8; MAGIC_LEN] {
+        let mut array = [0; MAGIC_LEN];
+        array.copy_from_slice(match self {
+            Self::First => MAGIC_1ST,
+            Self::Second => MAGIC_1ST,
+        });
+        array
+    }
+    pub fn from_byte_array(s: &[u8; MAGIC_LEN]) -> Option<Self> {
+        if s == MAGIC_1ST {
+            Some(Self::First)
+        } else if s == MAGIC_2ND {
+            Some(Self::Second)
+        } else {
+            None
+        }
+    }
+}
+
+pub enum ChecksumAlg {
+    Sha256,
+}
+
+impl ChecksumAlg {
+    pub fn as_byte_str(&self) -> &'static [u8] {
+        match self {
+            Self::Sha256 => b"sha256",
+        }
+    }
+    pub fn from_byte_str(s: &[u8]) -> Option<Self> {
+        if s == b"sha256" {
+            Some(Self::Sha256)
+        } else {
+            None
+        }
+    }
+}
+
+fn byte_str_to_array<const N: usize>(s: &'static [u8]) -> [u8; N] {
+    assert!(s.len() < N);
+    let mut array = [0; N];
+    array[..s.len()].copy_from_slice(s);
+    array
+}
+
+fn str_to_ascii_array<const N: usize>(ctx: &'static str, s: &str) -> Result<[u8; N], EncodeError> {
+    if !s.is_ascii() {
+        return Err(EncodeError::StringNotAscii { ctx });
+    }
+    let byte_str = s.as_bytes();
+    if byte_str.len() < N {
+        return Err(EncodeError::StringTooLong { ctx, n: N });
+    }
+    let mut array = [0; N];
+    array[..byte_str.len()].copy_from_slice(byte_str);
+    Ok(array)
+}
+
+fn ascii_byte_str_to_string(ctx: &'static str, s: &[u8]) -> Result<Option<String>, ParseError> {
+    if !s.is_ascii() {
+        return Err(ParseError::StringNotAscii { ctx });
+    }
+    if s[0] == 0 {
+        Ok(None)
+    } else {
+        Ok(Some(
+            std::str::from_utf8(s).expect("ascii in UTF-8").to_string(),
+        ))
+    }
+}
+
+pub struct LuksBinHeader2 {
+    pub magic: Magic,
+    /// header size plus JSON area in bytes
+    pub hdr_size: u64,
+    /// sequence ID, increased on update
+    pub seqid: u64,
+    /// ASCII label or empty
+    pub label: Option<String>,
+    /// checksum algorithm
+    pub csum_alg: ChecksumAlg,
+    /// salt, unique for every header
+    pub salt: [u8; SALT_LEN],
+    /// UUID of device
+    pub uuid: String,
+    /// owner subsystem label or empty
+    pub subsystem: Option<String>,
+    /// offset from device start in bytes
+    pub hdr_offset: u64,
+    /// header checksum
+    pub csum: [u8; CSUM_LEN],
+}
+
+impl TryFrom<&LuksBinHeader2> for LuksBinHeader {
+    type Error = EncodeError;
+    fn try_from(h: &LuksBinHeader2) -> Result<Self, Self::Error> {
+        fn opt_string_to_str(s: &Option<String>) -> &str {
+            s.as_ref().map(|s| s.as_str()).unwrap_or("")
+        }
+        Ok(Self {
+            magic: h.magic.as_byte_array(),
+            version: 2,
+            hdr_size: h.hdr_size,
+            seqid: h.seqid,
+            label: str_to_ascii_array("BinHeader.label", opt_string_to_str(&h.label))?,
+            csum_alg: byte_str_to_array(h.csum_alg.as_byte_str()),
+            salt: h.salt,
+            uuid: str_to_ascii_array("BinHeader.uuid", &h.uuid)?,
+            subsystem: str_to_ascii_array("BinHeader.subsystem", opt_string_to_str(&h.subsystem))?,
+            hdr_offset: h.hdr_offset,
+            _padding: [0; 184],
+            csum: h.csum,
+            _padding4069: [0; 7 * 512],
+        })
+    }
+}
+
+impl TryFrom<&LuksBinHeader> for LuksBinHeader2 {
+    type Error = ParseError;
+    fn try_from(h: &LuksBinHeader) -> Result<Self, Self::Error> {
+        // check header version
+        if h.version != 2 {
+            return Err(ParseError::InvalidHeaderVersion(h.version));
+        }
+        Ok(Self {
+            magic: Magic::from_byte_array(&h.magic).ok_or(ParseError::InvalidHeaderMagic)?,
+            hdr_size: h.hdr_size,
+            seqid: h.seqid,
+            label: ascii_byte_str_to_string("BinHeader.label", &h.label)?,
+            csum_alg: ChecksumAlg::from_byte_str(&h.csum_alg)
+                .ok_or(ParseError::UnsupportedChecksumAlgorithm(h.csum_alg))?,
+            salt: h.salt,
+            uuid: ascii_byte_str_to_string("BinHeader.uuid", &h.subsystem)?
+                .ok_or(ParseError::MissingUuid)?,
+            subsystem: ascii_byte_str_to_string("BinHeader.subsystem", &h.subsystem)?,
+            hdr_offset: h.hdr_offset,
+            csum: h.csum,
+        })
+    }
+}
 
 /// A LUKS2 header as described
 /// [here](https://gitlab.com/cryptsetup/LUKS2-docs/blob/master/luks2_doc_wip.pdf).

@@ -3,6 +3,16 @@ use crate::{CSUM_ALG_LEN, CSUM_LEN};
 use alloc::string::String;
 use thiserror_no_std::Error;
 
+/// Enum for errors arising during encoding.
+#[derive(Debug, Error)]
+pub enum EncodeError {
+    #[error("String in {ctx} is not ascii")]
+    StringNotAscii { ctx: &'static str },
+
+    #[error("String in {ctx} must be shorter than {n} bytes")]
+    StringTooLong { ctx: &'static str, n: usize },
+}
+
 /// Enum for errors arising during parsing.
 #[derive(Debug, Error)]
 pub enum ParseError {
@@ -47,6 +57,12 @@ pub enum ParseError {
 
     #[error("Unsupported checksum algorithm {}", &ByteStr(.0))]
     UnsupportedChecksumAlgorithm([u8; CSUM_ALG_LEN]),
+
+    #[error("String in {ctx} is not ascii")]
+    StringNotAscii { ctx: &'static str },
+
+    #[error("MissingUuid from BinHeader")]
+    MissingUuid,
 }
 
 /// Enum for errors arising during interaction with a [`LuksDevice`](crate::LuksDevice).
