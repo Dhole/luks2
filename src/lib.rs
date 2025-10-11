@@ -43,6 +43,7 @@ use core::{
 use crypto_common::Output;
 use hmac::Hmac;
 use secrecy::{CloneableSecret, DebugSecret, ExposeSecret, Secret, Zeroize};
+use serde::Serializer;
 use serde::{
     de::{self, Deserializer},
     Deserialize, Serialize,
@@ -70,6 +71,18 @@ pub(crate) const CSUM_ALG_LEN: usize = 32;
 pub(crate) const CSUM_LEN: usize = 64;
 pub(crate) const LUKS_BIN_HEADER_LEN: usize = 4096;
 pub(crate) const CSUM_ALG_SHA256: &[u8] = b"sha256\0";
+
+pub(crate) const PRIMARY_LEN_JSON_LEN: &[(usize, usize)] = &[
+    (0x004000, 12 * 1024),
+    (0x008000, 28 * 1024),
+    (0x010000, 60 * 1024),
+    (0x020000, 124 * 1024),
+    (0x040000, 252 * 1024),
+    (0x080000, 508 * 1024),
+    (0x100000, 1020 * 1024),
+    (0x200000, 2044 * 1024),
+    (0x400000, 4092 * 1024),
+];
 
 #[derive(Debug, Clone)]
 pub enum Magic {
@@ -159,7 +172,7 @@ fn ascii_cstr_to_string(ctx: &'static str, s: &[u8]) -> Result<Option<String>, P
 }
 
 #[derive(Debug, Clone)]
-pub struct LuksBinHeader {
+pub struct BinHeader {
     pub magic: Magic,
     /// header size plus JSON area in bytes
     pub hdr_size: u64,
@@ -178,7 +191,7 @@ pub struct LuksBinHeader {
     pub hdr_offset: u64,
 }
 
-impl Display for LuksBinHeader {
+impl Display for BinHeader {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         writeln!(f, "LuksBinHeader:")?;
         writeln!(f, "\tlocation: {:?}", self.magic)?;
@@ -195,9 +208,9 @@ impl Display for LuksBinHeader {
     }
 }
 
-impl TryFrom<&LuksBinHeader> for LuksBinHeaderRaw {
+impl TryFrom<&BinHeader> for BinHeaderRaw {
     type Error = EncodeError;
-    fn try_from(h: &LuksBinHeader) -> Result<Self, Self::Error> {
+    fn try_from(h: &BinHeader) -> Result<Self, Self::Error> {
         fn opt_string_to_str(s: &Option<String>) -> &str {
             s.as_ref().map(|s| s.as_str()).unwrap_or("")
         }
@@ -220,9 +233,9 @@ impl TryFrom<&LuksBinHeader> for LuksBinHeaderRaw {
     }
 }
 
-impl TryFrom<&LuksBinHeaderRaw> for LuksBinHeader {
+impl TryFrom<&BinHeaderRaw> for BinHeader {
     type Error = ParseError;
-    fn try_from(h: &LuksBinHeaderRaw) -> Result<Self, Self::Error> {
+    fn try_from(h: &BinHeaderRaw) -> Result<Self, Self::Error> {
         // check header version
         if h.version != 2 {
             return Err(ParseError::InvalidHeaderVersion(h.version));
@@ -246,7 +259,7 @@ impl TryFrom<&LuksBinHeaderRaw> for LuksBinHeader {
 /// A LUKS2 header as described
 /// [here](https://gitlab.com/cryptsetup/LUKS2-docs/blob/master/luks2_doc_wip.pdf).
 #[derive(Clone, Encode, Decode, PartialEq)]
-pub struct LuksBinHeaderRaw {
+pub struct BinHeaderRaw {
     /// must be `MAGIC_1ST` or `MAGIC_2ND`
     pub magic: [u8; MAGIC_LEN],
     /// Version 2
@@ -282,7 +295,7 @@ pub struct LuksBinHeaderRaw {
     _padding4069: [u8; 7 * 512],
 }
 
-impl LuksBinHeaderRaw {
+impl BinHeaderRaw {
     /// Attempt to read a LUKS2 header from a reader.
     ///
     /// Note: a LUKS2 header is always exactly 4096 bytes long.
@@ -291,18 +304,6 @@ impl LuksBinHeaderRaw {
             .with_big_endian()
             .with_fixed_int_encoding();
         let h: Self = bincode::decode_from_slice(slice, options)?.0;
-        // let h: BorrowCompat<Self> = bincode::decode_from_slice(slice, options)?.0;
-        // let h = h.0;
-
-        // check magic value (must be "LUKS\xba\xbe" or "SKUL\xba\xbe")
-        if (h.magic != MAGIC_1ST) && (h.magic != MAGIC_2ND) {
-            return Err(ParseError::InvalidHeaderMagic);
-        }
-        // check header version
-        if h.version != 2 {
-            return Err(ParseError::InvalidHeaderVersion(h.version));
-        }
-
         Ok(h)
     }
 
@@ -312,14 +313,10 @@ impl LuksBinHeaderRaw {
             .with_fixed_int_encoding();
         bincode::encode_into_slice(self, slice, options).map(|_| ())
     }
-
-    pub fn verify_checksum(&self) -> Result<(), ParseError> {
-        todo!()
-    }
 }
 
 // implement manually to omit always-zero padding sections
-impl Debug for LuksBinHeaderRaw {
+impl Debug for BinHeaderRaw {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("LuksBinHeader")
             .field("magic", &ByteStr(&self.magic))
@@ -337,17 +334,17 @@ impl Debug for LuksBinHeaderRaw {
     }
 }
 
-pub struct LuksHeader {
-    bin: LuksBinHeader,
+pub struct Header {
+    bin: BinHeader,
     json: LuksJson,
 }
 
-impl LuksHeader {
+impl Header {
     pub fn from_reader<R: Read>(mut r: R) -> Result<Self, LuksError> {
         let mut bin_header_bytes = vec![0; LUKS_BIN_HEADER_LEN];
         r.read_exact(&mut bin_header_bytes)?;
-        let bin_header_raw = LuksBinHeaderRaw::from_slice(&bin_header_bytes)?;
-        let bin_header = LuksBinHeader::try_from(&bin_header_raw)?;
+        let bin_header_raw = BinHeaderRaw::from_slice(&bin_header_bytes)?;
+        let bin_header = BinHeader::try_from(&bin_header_raw)?;
         let mut json_area_bytes = vec![0; bin_header.hdr_size as usize - LUKS_BIN_HEADER_LEN];
         r.read_exact(&mut json_area_bytes)?;
         Self::verify_checksum(&bin_header, &json_area_bytes)?;
@@ -359,12 +356,11 @@ impl LuksHeader {
         })
     }
 
-    fn verify_checksum_generic<H: Digest>(
-        csum: &Output<H>,
-        bin_header: &LuksBinHeader,
+    fn calculate_checksum_generic<H: Digest>(
+        bin_header: &BinHeader,
         json_area_bytes: &[u8],
-    ) -> Result<(), ParseError> {
-        let mut bin_header_raw = LuksBinHeaderRaw::try_from(bin_header).expect("valid roundtrip");
+    ) -> Output<H> {
+        let mut bin_header_raw = BinHeaderRaw::try_from(bin_header).expect("valid roundtrip");
         bin_header_raw.csum = [0; CSUM_LEN];
         let mut bin_header_bytes = vec![0; LUKS_BIN_HEADER_LEN];
         bin_header_raw
@@ -374,7 +370,15 @@ impl LuksHeader {
         let mut hasher = H::new();
         hasher.update(bin_header_bytes);
         hasher.update(json_area_bytes);
-        let result = hasher.finalize();
+        hasher.finalize()
+    }
+
+    fn verify_checksum_generic<H: Digest>(
+        csum: &Output<H>,
+        bin_header: &BinHeader,
+        json_area_bytes: &[u8],
+    ) -> Result<(), ParseError> {
+        let result = Self::calculate_checksum_generic::<H>(bin_header, json_area_bytes);
         if &result != csum {
             let (mut calculated, mut found) = ([0; CSUM_LEN], [0; CSUM_LEN]);
             calculated[..result.len()].copy_from_slice(&result);
@@ -385,10 +389,7 @@ impl LuksHeader {
         }
     }
 
-    fn verify_checksum(
-        bin_header: &LuksBinHeader,
-        json_area_bytes: &[u8],
-    ) -> Result<(), ParseError> {
+    fn verify_checksum(bin_header: &BinHeader, json_area_bytes: &[u8]) -> Result<(), ParseError> {
         match bin_header.checksum {
             Checksum::Sha256(ref csum) => {
                 Self::verify_checksum_generic::<Sha256>(csum, &bin_header, json_area_bytes)
@@ -397,15 +398,77 @@ impl LuksHeader {
     }
 }
 
+const ENC_AES_XTS_PLAIN64: &str = "aes-xts-plain64";
+
+#[derive(Debug, PartialEq)]
+pub enum Encryption {
+    AesXtsPlain64,
+    Unsupported(String),
+}
+
+impl Serialize for Encryption {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::AesXtsPlain64 => ENC_AES_XTS_PLAIN64,
+            Self::Unsupported(s) => s.as_str(),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for Encryption {
+    fn deserialize<D>(deserializer: D) -> Result<Encryption, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = <&'de str>::deserialize(deserializer)?;
+        Ok(if s == ENC_AES_XTS_PLAIN64 {
+            Self::AesXtsPlain64
+        } else {
+            Self::Unsupported(s.to_string())
+        })
+    }
+}
+
+/// Only the `raw` type is currently used.
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum AreaTypeData {
+    Raw {
+        /// The area encryption algorithm, in dm-crypt notation (e. g. "aes-xts-plain64").
+        encryption: Encryption,
+        /// The area encryption key size.
+        key_size: u32,
+    },
+}
+
+/// Information on the allocated area in the binary keyslots area of a [`LuksKeyslot`].
+///
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+pub struct Area2 {
+    #[serde(flatten)]
+    type_data: AreaTypeData,
+    /// The offset from the device start to the beginning of the binary area in bytes.
+    #[serde(deserialize_with = "from_str")]
+    offset: u64,
+    /// The area size in bytes.
+    #[serde(deserialize_with = "from_str")]
+    size: u64,
+}
+
+// TODO: Delete
 /// Information on the allocated area in the binary keyslots area of a [`LuksKeyslot`].
 ///
 /// Only the `raw` type is currently used.
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type")]
 // enum variant names must match the JSON values exactly, which are lowercase, so no CamelCase names
-#[allow(non_camel_case_types)]
+#[serde(rename_all = "snake_case")]
 pub enum LuksArea {
-    raw {
+    Raw {
         /// The area encryption algorithm, in dm-crypt notation (e. g. "aes-xts-plain64").
         encryption: String,
         /// The area encryption key size.
@@ -419,36 +482,89 @@ pub enum LuksArea {
     },
 }
 
+// TODO: Delete
 impl LuksArea {
     /// Returns the encryption algorithm of the area.
     pub fn encryption(&self) -> &String {
         match self {
-            LuksArea::raw { encryption, .. } => encryption,
+            LuksArea::Raw { encryption, .. } => encryption,
         }
     }
 
     /// Returns the key size of the area.
     pub fn key_size(&self) -> u32 {
         match self {
-            LuksArea::raw { key_size, .. } => *key_size,
+            LuksArea::Raw { key_size, .. } => *key_size,
         }
     }
 
     /// Returns the offset of the area.
     pub fn offset(&self) -> u64 {
         match self {
-            LuksArea::raw { offset, .. } => *offset,
+            LuksArea::Raw { offset, .. } => *offset,
         }
     }
 
     /// Returns the size of the area.
     pub fn size(&self) -> u64 {
         match self {
-            LuksArea::raw { size, .. } => *size,
+            LuksArea::Raw { size, .. } => *size,
         }
     }
 }
 
+const HASH_SHA256: &str = "sha256";
+
+#[derive(Debug, PartialEq)]
+pub enum Hash {
+    Sha256,
+    Unsupported(String),
+}
+
+impl Serialize for Hash {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(match self {
+            Self::Sha256 => ENC_AES_XTS_PLAIN64,
+            Self::Unsupported(s) => s.as_str(),
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for Hash {
+    fn deserialize<D>(deserializer: D) -> Result<Hash, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = <&'de str>::deserialize(deserializer)?;
+        Ok(if s == HASH_SHA256 {
+            Self::Sha256
+        } else {
+            Self::Unsupported(s.to_string())
+        })
+    }
+}
+
+/// An anti-forensic splitter of a [`LuksKeyslot`]. See
+/// [the LUKS1 spec](https://gitlab.com/cryptsetup/cryptsetup/wikis/Specification)
+/// for more information.
+///
+/// Only the `luks1` type compatible with LUKS1 is currently used.
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum Af2 {
+    Luks1 {
+        /// The number of stripes, for historical reasons only the 4000 value is supported.
+        stripes: u16, // only value of 4000 supported
+        /// The hash algorithm used.
+        hash: Hash,
+    },
+}
+
+// TODO: Delete
 /// An anti-forensic splitter of a [`LuksKeyslot`]. See
 /// [the LUKS1 spec](https://gitlab.com/cryptsetup/cryptsetup/wikis/Specification)
 /// for more information.
@@ -483,6 +599,67 @@ impl LuksAf {
     }
 }
 
+/// Only the `raw` type is currently used.
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum KdfTypeData {
+    Pbkdf2 {
+        /// The hash algorithm for the PKBDF.
+        hash: Hash,
+        /// The PBKDF2 iterations count.
+        iterations: u32,
+    },
+    Argon2i {
+        /// The time cost (in fact the iterations).
+        time: u32,
+        /// The memory cost in kilobytes. If not available, the keyslot cannot be unlocked.
+        memory: u32,
+        /// The required nuber of threads (CPU cores number cost). If not available, unlocking
+        /// will be slower.
+        cpus: u32,
+    },
+    Argon2id {
+        /// The time cost (in fact the iterations).
+        time: u32,
+        /// The memory cost in kilobytes. If not available, the keyslot cannot be unlocked.
+        memory: u32,
+        /// The required nuber of threads (CPU cores number cost). If not available, unlocking
+        /// will be slower.
+        cpus: u32,
+    },
+}
+
+pub(crate) mod bytes_base64 {
+    use serde::{de, Deserialize, Deserializer, Serializer};
+
+    pub(crate) fn serialize<S>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&base64::encode(bytes))
+    }
+
+    pub(crate) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = <&'de str>::deserialize(deserializer)?;
+        base64::decode(s).map_err(de::Error::custom)
+    }
+}
+
+/// Stores information on the PBKDF type and parameters of a [`LuksKeyslot`].
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+pub struct Kdf2 {
+    #[serde(flatten)]
+    type_data: KdfTypeData,
+    /// The salt for the PBKDF in base64 (binary data).
+    #[serde(with = "bytes_base64")]
+    salt: Vec<u8>,
+}
+
+// TODO: Delete
 /// Stores information on the PBKDF type and parameters of a [`LuksKeyslot`].
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type")]
@@ -521,6 +698,7 @@ pub enum LuksKdf {
     },
 }
 
+// TODO: Delete
 impl LuksKdf {
     /// Returns the salt for the PBKDF in base64 (binary data).
     pub fn salt(&self) -> &String {
@@ -532,6 +710,81 @@ impl LuksKdf {
     }
 }
 
+/// The priority of a [`LuksKeyslot`].
+#[derive(Debug, Default, Eq, PartialEq, PartialOrd, Ord)]
+pub enum Priority2 {
+    /// The slot should be used only if explicitly stated.
+    Ignore,
+    /// Normal priority keyslot.
+    #[default]
+    Normal,
+    /// Tried before normal priority keyslots.
+    High,
+}
+
+impl Serialize for Priority2 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u8(match self {
+            Self::Ignore => 0,
+            Self::Normal => 1,
+            Self::High => 2,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for Priority2 {
+    fn deserialize<D>(deserializer: D) -> Result<Priority2, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match u8::deserialize(deserializer)? {
+            0 => Ok(Self::Ignore),
+            1 => Ok(Self::Normal),
+            2 => Ok(Self::High),
+            p => Err(de::Error::custom(format!("invalid priority {}", p))),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type")]
+// enum variant names must match the JSON values exactly, which are lowercase, so no CamelCase names
+#[serde(rename_all = "snake_case")]
+pub enum KeyslotTypeData {
+    Luks2 {
+        /// The PBKDF type and parameters used.
+        kdf: Kdf2,
+        /// The anti-forensic splitter.
+        af: Af2,
+    },
+}
+
+/// A keyslot contains information about stored keys – areas, where binary keyslot data are located,
+/// encryption and anti-forensic function used, password-based key derivation function (PBKDF) and
+/// related parameters.
+///
+/// Only the `luks2` type is currently used.
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type")]
+// enum variant names must match the JSON values exactly, which are lowercase, so no CamelCase names
+#[serde(rename_all = "snake_case")]
+pub struct Keyslot2 {
+    #[serde(flatten)]
+    type_data: KeyslotTypeData,
+    /// The size of the key stored in the slot, in bytes.
+    key_size: u16,
+    /// The allocated area in the binary keyslots area.
+    area: Area2,
+    /// The keyslot priority (optional).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority: Option<Priority2>,
+}
+
+// TODO: Delete
 /// The priority of a [`LuksKeyslot`].
 #[derive(Debug, Deserialize, Eq, PartialEq, PartialOrd, Ord, Serialize)]
 // to match other enum variant names
@@ -545,6 +798,7 @@ pub enum LuksPriority {
     high,
 }
 
+// TODO: Delete
 /// A keyslot contains information about stored keys – areas, where binary keyslot data are located,
 /// encryption and anti-forensic function used, password-based key derivation function (PBKDF) and
 /// related parameters.
@@ -571,6 +825,7 @@ pub enum LuksKeyslot {
     },
 }
 
+// TODO: Delete
 impl LuksKeyslot {
     /// Returns the key size of the key stored in the slot, in bytes.
     pub fn key_size(&self) -> u16 {
@@ -948,7 +1203,7 @@ pub struct LuksDevice<T: Read + Seek> {
     current_sector: Cursor<Vec<u8>>,
     current_sector_num: u64,
     /// The header read from the device.
-    pub header: LuksBinHeaderRaw,
+    pub header: BinHeaderRaw,
     /// The JSON section read from the device.
     pub json: LuksJson,
     /// The sector size of the device.
@@ -990,7 +1245,7 @@ impl<T: Read + Seek> LuksDevice<T> {
         // read and parse LuksHeader
         let mut h = vec![0; 4096];
         device.read_exact(&mut h)?;
-        let header = LuksBinHeaderRaw::from_slice(&h)?;
+        let header = BinHeaderRaw::from_slice(&h)?;
 
         // read and parse LuksJson
         let mut j = vec![0; (header.hdr_size - 4096) as usize];

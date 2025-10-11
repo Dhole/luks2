@@ -8,7 +8,7 @@ fn parse_json() {
         0,
         LuksKeyslot::luks2 {
             key_size: 32,
-            area: LuksArea::raw {
+            area: LuksArea::Raw {
                 encryption: String::from("aes-xts-plain64"),
                 key_size: 32,
                 offset: 32768,
@@ -31,7 +31,7 @@ fn parse_json() {
         1,
         LuksKeyslot::luks2 {
             key_size: 32,
-            area: LuksArea::raw {
+            area: LuksArea::Raw {
                 encryption: String::from("aes-xts-plain64"),
                 key_size: 32,
                 offset: 163840,
