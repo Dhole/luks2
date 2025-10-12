@@ -46,7 +46,7 @@ use secrecy::{CloneableSecret, DebugSecret, ExposeSecret, Secret, Zeroize};
 use serde::Serializer;
 use serde::{
     de::{self, Deserializer},
-    Deserialize, Serialize,
+    ser, Deserialize, Serialize,
 };
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
@@ -70,7 +70,6 @@ pub(crate) const SALT_LEN: usize = 64;
 pub(crate) const CSUM_ALG_LEN: usize = 32;
 pub(crate) const CSUM_LEN: usize = 64;
 pub(crate) const LUKS_BIN_HEADER_LEN: usize = 4096;
-pub(crate) const CSUM_ALG_SHA256: &[u8] = b"sha256\0";
 
 pub(crate) const PRIMARY_LEN_JSON_LEN: &[(usize, usize)] = &[
     (0x004000, 12 * 1024),
@@ -127,7 +126,7 @@ impl Display for Checksum {
 impl Checksum {
     pub fn to_byte_arrays(&self) -> ([u8; CSUM_ALG_LEN], [u8; CSUM_LEN]) {
         let (s_csum_alg, s_csum) = match self {
-            Self::Sha256(csum) => (CSUM_ALG_SHA256, csum.as_slice()),
+            Self::Sha256(csum) => (b"sha256\0", csum.as_slice()),
         };
         let mut csum_alg = [0; CSUM_ALG_LEN];
         let mut csum = [0; CSUM_LEN];
@@ -136,7 +135,7 @@ impl Checksum {
         (csum_alg, csum)
     }
     pub fn from_byte_arrays(csum_alg: &[u8; CSUM_ALG_LEN], csum: &[u8; CSUM_LEN]) -> Option<Self> {
-        if csum_alg.starts_with(CSUM_ALG_SHA256) {
+        if csum_alg.starts_with(b"sha256\0") {
             Some(Self::Sha256(*Output::<Sha256>::from_slice(&csum[..32])))
         } else {
             None
@@ -171,6 +170,7 @@ fn ascii_cstr_to_string(ctx: &'static str, s: &[u8]) -> Result<Option<String>, P
     ascii_cstr_to_str(ctx, s).map(|s| if s == "" { None } else { Some(s.to_string()) })
 }
 
+/// Section 2.1
 #[derive(Debug, Clone)]
 pub struct BinHeader {
     pub magic: Magic,
@@ -258,6 +258,7 @@ impl TryFrom<&BinHeaderRaw> for BinHeader {
 
 /// A LUKS2 header as described
 /// [here](https://gitlab.com/cryptsetup/LUKS2-docs/blob/master/luks2_doc_wip.pdf).
+/// Section 2.1
 #[derive(Clone, Encode, Decode, PartialEq)]
 pub struct BinHeaderRaw {
     /// must be `MAGIC_1ST` or `MAGIC_2ND`
@@ -398,12 +399,10 @@ impl Header {
     }
 }
 
-const ENC_AES_XTS_PLAIN64: &str = "aes-xts-plain64";
-
 #[derive(Debug, PartialEq)]
 pub enum Encryption {
     AesXtsPlain64,
-    Unsupported(String),
+    Unknown(String),
 }
 
 impl Serialize for Encryption {
@@ -412,8 +411,8 @@ impl Serialize for Encryption {
         S: Serializer,
     {
         serializer.serialize_str(match self {
-            Self::AesXtsPlain64 => ENC_AES_XTS_PLAIN64,
-            Self::Unsupported(s) => s.as_str(),
+            Self::AesXtsPlain64 => "aes-xts-plain64",
+            Self::Unknown(s) => s.as_str(),
         })
     }
 }
@@ -424,10 +423,10 @@ impl<'de> Deserialize<'de> for Encryption {
         D: Deserializer<'de>,
     {
         let s = <&'de str>::deserialize(deserializer)?;
-        Ok(if s == ENC_AES_XTS_PLAIN64 {
+        Ok(if s == "aes-xts-plain64" {
             Self::AesXtsPlain64
         } else {
-            Self::Unsupported(s.to_string())
+            Self::Unknown(s.to_string())
         })
     }
 }
@@ -446,16 +445,16 @@ pub enum AreaTypeData {
 }
 
 /// Information on the allocated area in the binary keyslots area of a [`LuksKeyslot`].
-///
+/// Section 3.2.3
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub struct Area2 {
     #[serde(flatten)]
     type_data: AreaTypeData,
     /// The offset from the device start to the beginning of the binary area in bytes.
-    #[serde(deserialize_with = "from_str")]
+    #[serde(with = "t_str")]
     offset: u64,
     /// The area size in bytes.
-    #[serde(deserialize_with = "from_str")]
+    #[serde(with = "t_str")]
     size: u64,
 }
 
@@ -513,12 +512,10 @@ impl LuksArea {
     }
 }
 
-const HASH_SHA256: &str = "sha256";
-
 #[derive(Debug, PartialEq)]
 pub enum Hash {
     Sha256,
-    Unsupported(String),
+    Unknown(String),
 }
 
 impl Serialize for Hash {
@@ -527,8 +524,8 @@ impl Serialize for Hash {
         S: Serializer,
     {
         serializer.serialize_str(match self {
-            Self::Sha256 => ENC_AES_XTS_PLAIN64,
-            Self::Unsupported(s) => s.as_str(),
+            Self::Sha256 => "sha256",
+            Self::Unknown(s) => s.as_str(),
         })
     }
 }
@@ -539,17 +536,50 @@ impl<'de> Deserialize<'de> for Hash {
         D: Deserializer<'de>,
     {
         let s = <&'de str>::deserialize(deserializer)?;
-        Ok(if s == HASH_SHA256 {
+        Ok(if s == "sha256" {
             Self::Sha256
         } else {
-            Self::Unsupported(s.to_string())
+            Self::Unknown(s.to_string())
         })
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub struct Stripes {}
+
+impl Stripes {
+    pub fn as_usize() -> usize {
+        4_000
+    }
+}
+
+impl Serialize for Stripes {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u16(Self::as_usize() as u16)
+    }
+}
+
+impl<'de> Deserialize<'de> for Stripes {
+    fn deserialize<D>(deserializer: D) -> Result<Stripes, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v = u16::deserialize(deserializer)?;
+        if v == Self::as_usize() as u16 {
+            Ok(Stripes {})
+        } else {
+            Err(de::Error::custom(ParseError::InvalidStripes2(v)))
+        }
     }
 }
 
 /// An anti-forensic splitter of a [`LuksKeyslot`]. See
 /// [the LUKS1 spec](https://gitlab.com/cryptsetup/cryptsetup/wikis/Specification)
 /// for more information.
+/// Section 3.2.4
 ///
 /// Only the `luks1` type compatible with LUKS1 is currently used.
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
@@ -558,7 +588,7 @@ impl<'de> Deserialize<'de> for Hash {
 pub enum Af2 {
     Luks1 {
         /// The number of stripes, for historical reasons only the 4000 value is supported.
-        stripes: u16, // only value of 4000 supported
+        stripes: Stripes,
         /// The hash algorithm used.
         hash: Hash,
     },
@@ -649,7 +679,34 @@ pub(crate) mod bytes_base64 {
     }
 }
 
+pub(crate) mod t_str {
+    use alloc::string::ToString;
+    use core::fmt::Display;
+    use core::str::FromStr;
+    use serde::{de, Deserialize, Deserializer, Serializer};
+
+    pub(crate) fn serialize<S, T>(v: &T, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        T: ToString,
+        S: Serializer,
+    {
+        serializer.serialize_str(&v.to_string())
+    }
+
+    // taken from https://github.com/serde-rs/json/issues/317#issuecomment-300251188
+    pub(crate) fn deserialize<'de, T, D>(deserializer: D) -> Result<T, D::Error>
+    where
+        T: FromStr,
+        T::Err: Display,
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        T::from_str(&s).map_err(de::Error::custom)
+    }
+}
+
 /// Stores information on the PBKDF type and parameters of a [`LuksKeyslot`].
+/// Section 3.2.5
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub struct Kdf2 {
     #[serde(flatten)]
@@ -744,11 +801,12 @@ impl<'de> Deserialize<'de> for Priority2 {
             0 => Ok(Self::Ignore),
             1 => Ok(Self::Normal),
             2 => Ok(Self::High),
-            p => Err(de::Error::custom(format!("invalid priority {}", p))),
+            p => Err(de::Error::custom(ParseError::InvalidPriority(p))),
         }
     }
 }
 
+/// Section 3.2.1
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type")]
 // enum variant names must match the JSON values exactly, which are lowercase, so no CamelCase names
@@ -765,6 +823,7 @@ pub enum KeyslotTypeData {
 /// A keyslot contains information about stored keys – areas, where binary keyslot data are located,
 /// encryption and anti-forensic function used, password-based key derivation function (PBKDF) and
 /// related parameters.
+/// Section 3.2
 ///
 /// Only the `luks2` type is currently used.
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
@@ -863,6 +922,7 @@ impl LuksKeyslot {
     }
 }
 
+// TODO: Delete
 /// The LUKS2 user data integrity protection type, an experimental feature which is only included
 /// for parsing compatibility.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -884,6 +944,141 @@ pub enum LuksSegmentSize {
     fixed(u64),
 }
 
+/// The size of a [`LuksSegment`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum LuksSegmentSize2 {
+    /// Signals that the size of the underlying device should be used (dynamic resize).
+    Dynamic,
+    /// The size in bytes.
+    Fixed(u64),
+}
+
+impl Serialize for LuksSegmentSize2 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Dynamic => serializer.serialize_str("dynamic"),
+            Self::Fixed(n) => serializer.serialize_str(&n.to_string()),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LuksSegmentSize2 {
+    fn deserialize<D>(deserializer: D) -> Result<LuksSegmentSize2, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = <&'de str>::deserialize(deserializer)?;
+        Ok(if s == "dynamic" {
+            Self::Dynamic
+        } else {
+            Self::Fixed(u64::from_str(s).map_err(de::Error::custom)?)
+        })
+    }
+}
+
+/// The LUKS2 user data integrity protection type, an experimental feature which is unsupported in
+/// this implementation.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub enum LuksIntegrity2 {}
+
+impl<'de> Deserialize<'de> for LuksIntegrity2 {
+    fn deserialize<D>(_deserializer: D) -> Result<LuksIntegrity2, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Err(de::Error::custom("crypt.integrity is unsupported"))
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum SectorSize {
+    B512,
+    B1024,
+    B2048,
+    B4096,
+}
+
+impl SectorSize {
+    pub fn as_usize(&self) -> usize {
+        match self {
+            Self::B512 => 512,
+            Self::B1024 => 1024,
+            Self::B2048 => 2048,
+            Self::B4096 => 4096,
+        }
+    }
+}
+
+impl Serialize for SectorSize {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_u16(self.as_usize() as u16)
+    }
+}
+
+impl<'de> Deserialize<'de> for SectorSize {
+    fn deserialize<D>(deserializer: D) -> Result<SectorSize, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let v = u16::deserialize(deserializer)?;
+        match v {
+            512 => Ok(Self::B512),
+            1024 => Ok(Self::B1024),
+            2048 => Ok(Self::B2048),
+            4096 => Ok(Self::B4096),
+            s => Err(de::Error::custom(ParseError::InvalidSectorSize2(s))),
+        }
+    }
+}
+
+/// Section 3.3.2
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum SegmentTypeData {
+    Crypt {
+        /// The starting offset for the Initialization Vector.
+        #[serde(with = "t_str")]
+        iv_tweak: u64,
+        /// The segment encryption algorithm in dm-crypt notaton (e. g. "aes-xts-plain64").
+        encryption: Encryption,
+        /// The sector size for the segment (512, 1024, 2048, or 4096 bytes).
+        sector_size: SectorSize,
+        /// The LUKS2 user data integrity protection type (optional, unsupported).
+        #[serde(default)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        integrity: Option<LuksIntegrity2>,
+    },
+}
+
+/// A segment contains a definition of encrypted areas on the disk containing user data
+/// (in LUKS1 mentioned as the user data payload). For a normal LUKS device, there ist only
+/// one data segment present.
+/// Section 3.3
+///
+/// Only the `crypt` type is currently used.
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+pub struct Segment2 {
+    #[serde(flatten)]
+    type_data: SegmentTypeData,
+    /// The offset from the device start to the beginning of the segment in bytes.
+    #[serde(with = "t_str")]
+    offset: u64,
+    /// The segment size, see [`LuksSegmentSize`].
+    size: LuksSegmentSize2,
+    /// An array of strings marking the segment with additional information (optional).
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    flags: Vec<String>,
+}
+
+// TODO: Delete
 /// A segment contains a definition of encrypted areas on the disk containing user data
 /// (in LUKS1 mentioned as the user data payload). For a normal LUKS device, there ist only
 /// one data segment present.
@@ -918,6 +1113,7 @@ pub enum LuksSegment {
     },
 }
 
+// TODO: Delete
 impl LuksSegment {
     /// Returns the offset of the segment.
     pub fn offset(&self) -> u64 {
@@ -969,6 +1165,46 @@ impl LuksSegment {
     }
 }
 
+#[derive(Debug, PartialOrd, Eq, Ord, Deserialize, PartialEq, Serialize)]
+pub struct Index(#[serde(with = "t_str")] pub usize);
+
+// Section 3.4
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum DigestTypeData {
+    Pbkdf2 {
+        /// The hash algorithm used by PBKDF2.
+        hash: Hash,
+        /// The PBKDF2 iterations count.
+        iterations: u32,
+    },
+}
+
+/// A digest is used to verify that a key decrypted from a keyslot is correct. Digests are assigned
+/// to keyslots and segments. If it is not assigned to a segment, then it is a digest for an unbound
+/// key. Every keyslot must have one assigned digest. The key digest also specifies the exact key size
+/// for the encryption algorithm of the segment.
+/// Section 3.4
+///
+/// Only the `pbkdf2` type compatible with LUKS1 is used.
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+pub struct LuksDigest2 {
+    #[serde(flatten)]
+    type_data: DigestTypeData,
+    /// A list of keyslot numbers that are assigned to the digest.
+    keyslots: Vec<Index>,
+    /// A list of segment numbers that are assigned to the digest.
+    segments: Vec<Index>,
+    /// The binary salt for the digest, in base64.
+    #[serde(with = "bytes_base64")]
+    salt: Vec<u8>,
+    /// The binary digest data, in base64.
+    #[serde(with = "bytes_base64")]
+    digest: Vec<u8>,
+}
+
+// TODO: Delete
 /// A digest is used to verify that a key decrypted from a keyslot is correct. Digests are assigned
 /// to keyslots and segments. If it is not assigned to a segment, then it is a digest for an unbound
 /// key. Every keyslot must have one assigned digest. The key digest also specifies the exact key size
@@ -998,6 +1234,7 @@ pub enum LuksDigest {
     },
 }
 
+// TODO: Delete
 impl LuksDigest {
     /// Returns the keyslots assigned to the digest.
     pub fn keyslots(&self) -> &Vec<u8> {
@@ -1042,6 +1279,42 @@ impl LuksDigest {
     }
 }
 
+#[derive(Debug, PartialEq, Serialize)]
+pub enum Requirement {}
+
+impl<'de> Deserialize<'de> for Requirement {
+    fn deserialize<D>(deserializer: D) -> Result<Requirement, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = <&'de str>::deserialize(deserializer)?;
+        Err(de::Error::custom(ParseError::UnsupportedRequirement(
+            s.to_string(),
+        )))
+    }
+}
+
+/// Global attributes for the LUKS device.
+/// Section 3.5
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+pub struct LuksConfig2 {
+    /// The JSON area size in bytes. Must match the binary header.
+    #[serde(with = "t_str")]
+    pub json_size: u64,
+    /// The binary keyslot area size in bytes. Must be aligned to 4096 bytes.
+    #[serde(with = "t_str")]
+    pub keyslots_size: u64,
+    /// An optional list of persistent flags for the device.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flags: Option<Vec<String>>,
+    /// An optional list of additional required features for the LUKS device.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requirements: Option<Vec<Requirement>>,
+}
+
+// TODO: Delete
 /// Global attributes for the LUKS device.
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub struct LuksConfig {
@@ -1062,9 +1335,66 @@ pub struct LuksConfig {
 /// A token is an object that can describe how to get a passphrase to unlock a particular keyslot.
 /// It can also contain additional user-defined JSON metadata. No token types are implemented;
 /// this is only included for parsing compatibility.
+/// Section 3.6
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+pub struct LuksToken2 {
+    #[serde(rename = "type")]
+    token_type: String,
+    keyslots: Vec<Index>,
+    #[serde(flatten)]
+    type_data: BTreeMap<String, serde_json::Value>,
+}
+
+// TODO: Delete
+/// A token is an object that can describe how to get a passphrase to unlock a particular keyslot.
+/// It can also contain additional user-defined JSON metadata. No token types are implemented;
+/// this is only included for parsing compatibility.
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 pub struct LuksToken {}
 
+/// JSON metadata for the device as described
+/// [here](https://gitlab.com/cryptsetup/LUKS2-docs/blob/master/luks2_doc_wip.pdf).
+/// Section 3
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+pub struct LuksJson2 {
+    /// Objects describing encrypted keys storage areas.
+    pub keyslots: BTreeMap<Index, Keyslot2>,
+    /// Tokens can optionally include additional metadata. Only included for parsing compatibility.
+    pub tokens: BTreeMap<Index, LuksToken2>,
+    /// Segments describe areas on disk that contain user encrypted data.
+    pub segments: BTreeMap<Index, Segment2>,
+    /// Digests are used to verify that keys decrypted from keyslots are correct. Uses the keys
+    /// of keyslots and segments to reference them.
+    pub digests: BTreeMap<Index, LuksDigest2>,
+    /// Persistent header configuration attributes.
+    pub config: LuksConfig2,
+}
+
+impl LuksJson2 {
+    /// Attempt to read a LUKS2 JSON area from a reader. The reader must contain exactly the JSON data
+    /// and nothing more.
+    fn from_slice(slice: &[u8]) -> Result<Self, ParseError> {
+        let j: Self = serde_json::from_slice(slice)?;
+
+        // check that keyslots size is aligned to 4096
+        if (j.config.keyslots_size % 4096) != 0 {
+            return Err(ParseError::KeyslotNotAligned);
+        }
+
+        // check that all segments/keyslots references are valid
+        let refs_valid = j.digests.iter().all(|(_, d)| {
+            d.keyslots.iter().all(|k| j.keyslots.contains_key(k))
+                && d.segments.iter().all(|s| j.segments.contains_key(s))
+        });
+        if !refs_valid {
+            return Err(ParseError::InvalidReference);
+        }
+
+        Ok(j)
+    }
+}
+
+// TODO: Delete
 /// JSON metadata for the device as described
 /// [here](https://gitlab.com/cryptsetup/LUKS2-docs/blob/master/luks2_doc_wip.pdf).
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
@@ -1082,6 +1412,7 @@ pub struct LuksJson {
     pub config: LuksConfig,
 }
 
+// TODO: Delete
 impl LuksJson {
     /// Attempt to read a LUKS2 JSON area from a reader. The reader must contain exactly the JSON data
     /// and nothing more.

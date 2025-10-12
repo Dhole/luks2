@@ -34,8 +34,20 @@ pub enum ParseError {
     )]
     InvalidStripes,
 
+    #[error(
+        "Invalid stripes value in JSON: stripes value of the antiforensic splitter must be \
+	4000, found {0}"
+    )]
+    InvalidStripes2(u16),
+
+    #[error("Invalid keyslot priority value in JSON: must be 0, 1 or 2; found {0}")]
+    InvalidPriority(u8),
+
     #[error("Invalid sector size in JSON: must be 512, 1024, 2048 or 4096")]
     InvalidSectorSize,
+
+    #[error("Invalid sector size in JSON: must be 512, 1024, 2048 or 4096; found {0}")]
+    InvalidSectorSize2(u16),
 
     #[error("Invalid keyslot size in JSON: must be aligned to 4096 bytes")]
     KeyslotNotAligned,
@@ -51,6 +63,9 @@ pub enum ParseError {
         calculated: [u8; CSUM_LEN],
         found: [u8; CSUM_LEN],
     },
+
+    #[error("Unsupported config requirement in JSON {0}")]
+    UnsupportedRequirement(String),
 
     #[error("Unsupported checksum algorithm {}", &ByteStr(.0))]
     UnsupportedChecksumAlgorithm([u8; CSUM_ALG_LEN]),

@@ -1,4 +1,4 @@
-use luks2::{LuksBinHeader, LuksBinHeaderRaw, LuksHeader};
+use luks2::{BinHeader, BinHeaderRaw, Header};
 use std::convert::TryFrom;
 use std::{fs::File, io::Read};
 
@@ -9,12 +9,12 @@ fn test_luks_header() {
     let mut f = File::open(&path).expect("could not open test.iso; did you create it?");
     let mut h = vec![0; 4096];
     f.read_exact(&mut h).unwrap();
-    let bin_header_raw = LuksBinHeaderRaw::from_slice(&h).unwrap();
+    let bin_header_raw = BinHeaderRaw::from_slice(&h).unwrap();
     println!("{:?}", bin_header_raw);
-    let bin_header = LuksBinHeader::try_from(&bin_header_raw).unwrap();
+    let bin_header = BinHeader::try_from(&bin_header_raw).unwrap();
     println!("{}", bin_header);
     drop(f);
 
     let mut f = File::open(&path).expect("could not open test.iso; did you create it?");
-    let header = LuksHeader::from_reader(&mut f).unwrap();
+    let header = Header::from_reader(&mut f).unwrap();
 }
