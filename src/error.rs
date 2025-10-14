@@ -55,25 +55,31 @@ pub enum ParseError {
     #[error("Invalid reference in JSON: a nonexistent keyslot or segment was referenced")]
     InvalidReference,
 
-    #[error("Missing null character in C-string {ctx}")]
+    #[error("Invalid reference in JSON: keyslot {0} is nonexistent")]
+    InvalidKeyslotReference(usize),
+
+    #[error("Invalid reference in JSON: segment {0} is nonexistent")]
+    InvalidSegmentReference(usize),
+
+    #[error("Invalid string in {ctx}: missing null character")]
     NoNullInCStr { ctx: &'static str },
 
-    #[error("Invalid checksum: calculated={:?}, found={:?}", &Bytes(.calculated), &Bytes(.found))]
+    #[error("Invalid header checksum: calculated={:?}, found={:?}", &Bytes(.calculated), &Bytes(.found))]
     InvalidChecksum {
         calculated: [u8; CSUM_LEN],
         found: [u8; CSUM_LEN],
     },
 
-    #[error("Unsupported config requirement in JSON {0}")]
+    #[error("Unsupported config requirement in JSON: {0}")]
     UnsupportedRequirement(String),
 
-    #[error("Unsupported checksum algorithm {}", &ByteStr(.0))]
+    #[error("Unsupported checksum algorithm: {}", &ByteStr(.0))]
     UnsupportedChecksumAlgorithm([u8; CSUM_ALG_LEN]),
 
-    #[error("String in {ctx} is not ascii")]
+    #[error("Invalid string in {ctx}: not ascii")]
     StringNotAscii { ctx: &'static str },
 
-    #[error("MissingUuid from BinHeader")]
+    #[error("Missing uuid from BinHeader")]
     MissingUuid,
 }
 
@@ -92,11 +98,20 @@ pub enum LuksError {
     #[error("Unsupported hash function used by anti-forensic splitter: {0}")]
     UnsupportedAfHash(String),
 
+    #[error("Unsupported hash function used by pbkdf2: {0}")]
+    UnsupportedPbkdf2Hash(String),
+
     #[error("Unsupported hash function used by digest: {0}")]
     UnsupportedDigestHash(String),
 
     #[error("Unsupported key size: {0}")]
     UnsupportedKeySize(u32),
+
+    #[error("Unsupported key size: {0}")]
+    UnsupportedKeySize2(usize),
+
+    #[error("Unsupported area encryption: {0}")]
+    UnsupportedAreaEncryption(String),
 
     #[error("Could not deserialize base64: {0}")]
     Base64Error(#[from] base64::DecodeError),
@@ -110,4 +125,16 @@ pub enum LuksError {
     #[cfg(feature = "std")]
     #[error("Error during password input: {0}")]
     PasswordError(#[from] crossterm::ErrorKind),
+
+    #[error("No Keyslots")]
+    NoKeyslots,
+
+    #[error("No Segments")]
+    NoSegments,
+
+    #[error("No Digests")]
+    NoDigests,
+
+    #[error("No Digest for Segment 0")]
+    NoDigestsSegment0,
 }

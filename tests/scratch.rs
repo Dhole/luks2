@@ -95,10 +95,10 @@ fn test_json_2() {
 
 #[test]
 fn test_json_3() {
-    use luks2::LuksJson2;
+    use luks2::new_lib::LuksJson;
 
     let data = String::from_utf8(include_bytes!("test.json").to_vec()).unwrap();
-    let parsed: LuksJson2 = serde_json::from_str(&data).unwrap();
+    let parsed: LuksJson = serde_json::from_str(&data).unwrap();
     println!("{:?}", parsed);
 
     // Compare read JSON vs recovered JSON

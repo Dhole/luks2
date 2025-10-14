@@ -7,7 +7,7 @@ use std::{fs::File, os::unix::prelude::AsRawFd};
 extern crate nix;
 
 fn main() {
-    let path = "/dev/nvme0n1p2";
+    let path = "/dev/nvme0n1p3";
     let partition = File::open(path).expect("could not open partition (are you root?)");
 
     let sector_size = unsafe {
@@ -19,6 +19,7 @@ fn main() {
         );
         ss
     };
+    dbg!(sector_size);
 
     println!("Enter password for partition: ");
     let password = password::read().expect("could not read password");
@@ -27,6 +28,6 @@ fn main() {
         LuksDevice::from_device(partition, password.expose_secret().as_bytes(), sector_size)
             .expect("could not create luks device");
 
-    println!("{}", luks_device.header);
+    println!("{:?}", luks_device.header);
     println!("{:#?}", luks_device.json);
 }
