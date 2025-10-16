@@ -4,7 +4,7 @@ use std::{fs::File, io::Read};
 
 #[test]
 fn test_luks_header() {
-    // create test.iso via `fallocate -l 16M test.iso && cryptsetup luksFormat test.iso` with the password "password"
+    // create test.img with `mk_test_img.sh`
     let path = format!("{}/tests/test.iso", env!("CARGO_MANIFEST_DIR"));
     let mut f = File::open(&path).expect("could not open test.iso; did you create it?");
     let mut h = vec![0; 4096];

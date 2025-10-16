@@ -16,48 +16,46 @@ extern crate alloc;
 pub mod af;
 /// Custom error types.
 pub mod error;
+/// Helper utilities
+pub mod utils;
 
-mod utils;
-
-use crate::error::{EncodeError, LuksError, ParseError};
-use acid_io::{self, Cursor, ErrorKind, Read, Seek, SeekFrom};
-use aes::{cipher::KeyInit, Aes128, Aes256};
-use alloc::collections::BTreeMap;
-use alloc::string::String;
-use alloc::vec;
-use alloc::vec::Vec;
-use bincode::{Decode, Encode};
-use core::cmp::max;
-use core::convert::TryFrom;
+use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::{
-    ffi::CStr,
+    cmp::max,
+    convert::TryFrom,
     fmt::{Debug, Display},
     str::FromStr,
 };
+
+use crate::error::{EncodeError, LuksError, ParseError};
+use crate::utils::{ascii_cstr_to_str, ascii_cstr_to_string, str_to_ascii_array};
+
+use acid_io::{self, Cursor, ErrorKind, Read, Seek, SeekFrom};
+use aes::{cipher::KeyInit, Aes128, Aes256};
+use bincode::{Decode, Encode};
 use crypto_common::Output;
 use digest;
 use hmac::Hmac;
 use pbkdf2::pbkdf2;
 use secrecy::{CloneableSecret, DebugSecret, ExposeSecret, Secret, Zeroize};
-use serde::Serializer;
 use serde::{
     de::{self, Deserializer},
-    Deserialize, Serialize,
+    Deserialize, Serialize, Serializer,
 };
 use sha1::Sha1;
 use sha2::Sha256;
 use utils::Bytes;
 use xts_mode::{get_tweak_default, Xts128};
 
-pub(crate) const MAGIC_1ST: &[u8] = b"LUKS\xba\xbe";
-pub(crate) const MAGIC_2ND: &[u8] = b"SKUL\xba\xbe";
-pub(crate) const MAGIC_LEN: usize = 6;
-pub(crate) const UUID_LEN: usize = 40;
-pub(crate) const LABEL_LEN: usize = 48;
-pub(crate) const SALT_LEN: usize = 64;
-pub(crate) const CSUM_ALG_LEN: usize = 32;
-pub(crate) const CSUM_LEN: usize = 64;
-pub(crate) const LUKS_BIN_HEADER_LEN: usize = 4096;
+pub const MAGIC_1ST: &[u8] = b"LUKS\xba\xbe";
+pub const MAGIC_2ND: &[u8] = b"SKUL\xba\xbe";
+pub const MAGIC_LEN: usize = 6;
+pub const UUID_LEN: usize = 40;
+pub const LABEL_LEN: usize = 48;
+pub const SALT_LEN: usize = 64;
+pub const CSUM_ALG_LEN: usize = 32;
+pub const CSUM_LEN: usize = 64;
+pub const LUKS_BIN_HEADER_LEN: usize = 4096;
 
 pub(crate) const PRIMARY_LEN_JSON_LEN: &[(usize, usize)] = &[
     (0x004000, 12 * 1024),
@@ -130,33 +128,6 @@ impl Checksum {
     }
 }
 
-fn str_to_ascii_array<const N: usize>(ctx: &'static str, s: &str) -> Result<[u8; N], EncodeError> {
-    if !s.is_ascii() {
-        return Err(EncodeError::StringNotAscii { ctx });
-    }
-    let byte_str = s.as_bytes();
-    if !(byte_str.len() < N) {
-        return Err(EncodeError::StringTooLong { ctx, n: N });
-    }
-    let mut array = [0; N];
-    array[..byte_str.len()].copy_from_slice(byte_str);
-    Ok(array)
-}
-
-fn ascii_cstr_to_str<'a>(ctx: &'static str, s: &'a [u8]) -> Result<&'a str, ParseError> {
-    if !s.is_ascii() {
-        return Err(ParseError::StringNotAscii { ctx });
-    }
-    Ok(CStr::from_bytes_until_nul(s)
-        .map_err(|_| ParseError::NoNullInCStr { ctx })?
-        .to_str()
-        .expect("ascii is subset of UTF-8"))
-}
-
-fn ascii_cstr_to_string(ctx: &'static str, s: &[u8]) -> Result<Option<String>, ParseError> {
-    ascii_cstr_to_str(ctx, s).map(|s| if s == "" { None } else { Some(s.to_string()) })
-}
-
 /// Section 2.1
 #[derive(Debug, Clone)]
 pub struct BinHeader {
@@ -180,7 +151,7 @@ pub struct BinHeader {
 
 impl Display for BinHeader {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        writeln!(f, "LuksBinHeader:")?;
+        writeln!(f, "Luks BinHeader:")?;
         writeln!(f, "\tlocation: {:?}", self.magic)?;
         writeln!(f, "\tversion: 2")?;
         writeln!(f, "\thdr_size: {}", self.hdr_size)?;
@@ -457,7 +428,7 @@ impl<'de> Deserialize<'de> for Stripes {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Stripes, D::Error> {
         match u16::deserialize(deserializer)? {
             4_000 => Ok(Stripes {}),
-            v => Err(de::Error::custom(ParseError::InvalidStripes2(v))),
+            v => Err(de::Error::custom(ParseError::InvalidStripes(v))),
         }
     }
 }
@@ -662,7 +633,7 @@ impl<'de> Deserialize<'de> for SectorSize {
             1024 => Ok(Self::B1024),
             2048 => Ok(Self::B2048),
             4096 => Ok(Self::B4096),
-            s => Err(de::Error::custom(ParseError::InvalidSectorSize2(s))),
+            s => Err(de::Error::custom(ParseError::InvalidSectorSize(s))),
         }
     }
 }
@@ -796,7 +767,7 @@ pub struct Token {
 /// [here](https://gitlab.com/cryptsetup/LUKS2-docs/blob/master/luks2_doc_wip.pdf).
 /// Section 3
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
-pub struct Json {
+pub struct JsonHeader {
     /// Objects describing encrypted keys storage areas.
     #[serde(with = "list")]
     pub keyslots: Vec<Keyslot>,
@@ -814,10 +785,20 @@ pub struct Json {
     pub config: Config,
 }
 
-impl Json {
+impl Display for JsonHeader {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "Luks JsonHeader: {}",
+            serde_json::to_string_pretty(&self).expect("valid json serialization")
+        )
+    }
+}
+
+impl JsonHeader {
     /// Attempt to read a LUKS2 JSON area from a reader. The reader must contain exactly the JSON data
     /// and nothing more.
-    fn from_slice(slice: &[u8]) -> Result<Self, ParseError> {
+    pub fn from_slice(slice: &[u8]) -> Result<Self, ParseError> {
         let j: Self = serde_json::from_slice(slice)?;
 
         // check that keyslots size is aligned to 4096
@@ -846,7 +827,15 @@ impl Json {
 #[derive(Debug)]
 pub struct Header {
     bin: BinHeader,
-    json: Json,
+    json: JsonHeader,
+}
+
+impl Display for Header {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        Display::fmt(&self.bin, f)?;
+        Display::fmt(&self.json, f)?;
+        Ok(())
+    }
 }
 
 impl Header {
@@ -855,14 +844,14 @@ impl Header {
         r.read_exact(&mut bin_header_bytes)?;
         let bin_header_raw = BinHeaderRaw::from_slice(&bin_header_bytes)?;
         let bin_header = BinHeader::try_from(&bin_header_raw)?;
-        let mut json_area_bytes = vec![0; bin_header.hdr_size as usize - LUKS_BIN_HEADER_LEN];
-        r.read_exact(&mut json_area_bytes)?;
-        Self::verify_checksum(&bin_header, &json_area_bytes)?;
-        let json_area_str = ascii_cstr_to_str("json_area", &json_area_bytes)?;
-        let json_area = Json::from_slice(&json_area_str.as_bytes())?;
+        let mut json_header_bytes = vec![0; bin_header.hdr_size as usize - LUKS_BIN_HEADER_LEN];
+        r.read_exact(&mut json_header_bytes)?;
+        Self::verify_checksum(&bin_header, &json_header_bytes)?;
+        let json_header_str = ascii_cstr_to_str("json_header", &json_header_bytes)?;
+        let json_header = JsonHeader::from_slice(&json_header_str.as_bytes())?;
         Ok(Self {
             bin: bin_header,
-            json: json_area,
+            json: json_header,
         })
     }
 
@@ -955,7 +944,7 @@ enum PasswordOrMasterKey<'a> {
 
 impl<T: Read + Seek> LuksDevice<T> {
     /// Creates a `LuksDevice` from a device (i. e. any type that implements [`Read`] and [`Seek`]).
-    fn from_device(device: T, password: &[u8]) -> Result<Self, LuksError> {
+    pub fn from_device(device: T, password: &[u8]) -> Result<Self, LuksError> {
         Self::from_device_internal(device, PasswordOrMasterKey::Password(password))
     }
 
@@ -1022,7 +1011,7 @@ impl<T: Read + Seek> LuksDevice<T> {
         match encryption {
             Encryption::AesXtsPlain64 => match master_key.expose_secret().0.len() {
                 32 | 64 => {}
-                x => return Err(LuksError::UnsupportedKeySize2("aes-xts-plain64", x)),
+                x => return Err(LuksError::UnsupportedKeySize("aes-xts-plain64", x)),
             },
             Encryption::Unknown(e) => {
                 return Err(LuksError::UnsupportedSegmentEncryption(e.clone()))
@@ -1145,7 +1134,7 @@ impl<T: Read + Seek> LuksDevice<T> {
                     let xts = Xts128::<Aes256>::new(key1, key2);
                     xts.decrypt_area(&mut k, LUKS_SECTOR_SIZE, 0, get_tweak_default);
                 }
-                x => return Err(LuksError::UnsupportedKeySize2("aes-xts-plain64", *x)),
+                x => return Err(LuksError::UnsupportedKeySize("aes-xts-plain64", *x)),
             },
             Encryption::Unknown(e) => return Err(LuksError::UnsupportedAreaEncryption(e.clone())),
         }

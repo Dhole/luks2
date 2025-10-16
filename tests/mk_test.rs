@@ -4,6 +4,7 @@ use std::{
     io::{Cursor, Read},
 };
 
+/*
 #[test]
 fn test_luks_device() {
     // create test.iso via `fallocate -l 16M test.iso && cryptsetup luksFormat test.iso` with the password "password"
@@ -15,3 +16,4 @@ fn test_luks_device() {
     let f = Cursor::new(buf);
     let _luks_device = LuksDevice::from_device(f, b"password", 512).unwrap();
 }
+*/

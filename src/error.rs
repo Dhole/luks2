@@ -1,5 +1,6 @@
 use crate::utils::{ByteStr, Bytes};
 use crate::{CSUM_ALG_LEN, CSUM_LEN};
+
 use alloc::string::String;
 use thiserror_no_std::Error;
 
@@ -30,24 +31,15 @@ pub enum ParseError {
 
     #[error(
         "Invalid stripes value in JSON: stripes value of the antiforensic splitter must be \
-	4000"
-    )]
-    InvalidStripes,
-
-    #[error(
-        "Invalid stripes value in JSON: stripes value of the antiforensic splitter must be \
 	4000, found {0}"
     )]
-    InvalidStripes2(u16),
+    InvalidStripes(u16),
 
     #[error("Invalid keyslot priority value in JSON: must be 0, 1 or 2; found {0}")]
     InvalidPriority(u8),
 
-    #[error("Invalid sector size in JSON: must be 512, 1024, 2048 or 4096")]
-    InvalidSectorSize,
-
     #[error("Invalid sector size in JSON: must be 512, 1024, 2048 or 4096; found {0}")]
-    InvalidSectorSize2(u16),
+    InvalidSectorSize(u16),
 
     #[error("Invalid keyslot size in JSON: must be aligned to 4096 bytes")]
     KeyslotNotAligned,
@@ -104,11 +96,8 @@ pub enum LuksError {
     #[error("Unsupported hash function used by digest: {0}")]
     UnsupportedDigestHash(String),
 
-    #[error("Unsupported key size: {0}")]
-    UnsupportedKeySize(u32),
-
     #[error("Unsupported key size for {0} encryption: {1}")]
-    UnsupportedKeySize2(&'static str, usize),
+    UnsupportedKeySize(&'static str, usize),
 
     #[error("Unsupported area encryption: {0}")]
     UnsupportedAreaEncryption(String),
