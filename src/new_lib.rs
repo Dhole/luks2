@@ -8,6 +8,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use bincode::{Decode, Encode};
+use core::cmp::max;
 use core::convert::TryFrom;
 use core::{
     ffi::CStr,
@@ -618,7 +619,7 @@ pub enum SectorSize {
 }
 
 impl SectorSize {
-    pub fn as_usize(&self) -> usize {
+    pub fn as_u64(&self) -> u64 {
         match self {
             Self::B512 => 512,
             Self::B1024 => 1024,
@@ -630,7 +631,7 @@ impl SectorSize {
 
 impl Serialize for SectorSize {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.serialize_u16(self.as_usize() as u16)
+        serializer.serialize_u16(self.as_u64() as u16)
     }
 }
 
@@ -912,14 +913,15 @@ pub struct LuksDevice<T: Read + Seek> {
     device: T,
     header: Header,
     master_key: SecretMasterKey,
-    // current_sector: Cursor<Vec<u8>>,
-    // current_sector_num: u64,
+    current_sector: Cursor<Vec<u8>>,
+    current_sector_num: u64,
     // /// The header read from the device.
     // pub header: BinHeaderRaw,
     // /// The JSON section read from the device.
     // pub json: LuksJson,
     // /// The sector size of the device.
     // pub sector_size: usize,
+    active_segment_size: u64,
     // /// The segment used when reading from the device. Defaults to segment 0. Calls to `seek()` will
     // /// be considered relative to `active_segment.offset()` if seeking from the start or `active_segment.size()`
     // /// if seeking from the end.
@@ -972,12 +974,53 @@ impl<T: Read + Seek> LuksDevice<T> {
             .ok_or(LuksError::NoSegments)?
             .clone();
 
-        Ok(Self {
+        let active_segment_size = match active_segment.size {
+            SegmentSize::Fixed(s) => s,
+            SegmentSize::Dynamic => {
+                let end = device.seek(SeekFrom::End(0))?;
+                end - active_segment.offset
+            }
+        };
+
+        let Segment {
+            type_data:
+                SegmentTypeData::Crypt {
+                    sector_size,
+                    encryption,
+                    ..
+                },
+            ..
+        } = &active_segment;
+        if active_segment_size % sector_size.as_u64() != 0 {
+            // NOTE: Maybe instead of erroring we should just set active_segment_size to the
+            // smallest closest multiple of sector_size?
+            return Err(LuksError::InvalidSegmentSize {
+                segment_size: active_segment_size,
+                sector_size: sector_size.as_u64(),
+            });
+        }
+        match encryption {
+            Encryption::AesXtsPlain64 => match master_key.expose_secret().0.len() {
+                32 | 64 => {}
+                x => return Err(LuksError::UnsupportedKeySize2("aes-xts-plain64", x)),
+            },
+            Encryption::Unknown(e) => {
+                return Err(LuksError::UnsupportedSegmentEncryption(e.clone()))
+            }
+        }
+
+        let mut d = Self {
             device,
             header,
             master_key,
+            current_sector: Cursor::new(vec![0; 256]),
+            current_sector_num: u64::MAX,
+            active_segment_size,
             active_segment,
-        })
+        };
+        d.seek(SeekFrom::Start(0))?;
+
+        Ok(d)
     }
 
     // tries to decrypt the master key with the given password by trying all available keyslots
@@ -1082,7 +1125,7 @@ impl<T: Read + Seek> LuksDevice<T> {
                     let xts = Xts128::<Aes256>::new(key1, key2);
                     xts.decrypt_area(&mut k, LUKS_SECTOR_SIZE, 0, get_tweak_default);
                 }
-                x => return Err(LuksError::UnsupportedKeySize2(*x)),
+                x => return Err(LuksError::UnsupportedKeySize2("aes-xts-plain64", *x)),
             },
             Encryption::Unknown(e) => return Err(LuksError::UnsupportedAreaEncryption(e.clone())),
         }
@@ -1126,5 +1169,130 @@ impl<T: Read + Seek> LuksDevice<T> {
         } else {
             Err(LuksError::InvalidPassword)
         }
+    }
+
+    // updates the internal state so that current sector is the one with the given number
+    // decrypts the sector, performs boundary checks (returns an error if sector_num too small,
+    // goes to last sector if sector_num too big)
+    fn go_to_sector(&mut self, sector_num: u64) -> acid_io::Result<()> {
+        let Segment {
+            type_data:
+                SegmentTypeData::Crypt {
+                    iv_tweak,
+                    sector_size,
+                    encryption,
+                    ..
+                },
+            ..
+        } = &self.active_segment;
+        let sector_size = sector_size.as_u64();
+        if sector_num == self.current_sector_num {
+            return Ok(());
+        } else if sector_num < (self.active_segment.offset / sector_size as u64) {
+            return Err(acid_io::Error::new(
+                ErrorKind::InvalidInput,
+                "tried to seek to position before active segment",
+            ));
+        }
+
+        let max_sector = (self.active_segment.offset + self.active_segment_size) / sector_size - 1;
+        if sector_num > max_sector {
+            self.current_sector = Cursor::new(vec![]);
+            self.current_sector_num = sector_num;
+            return Ok(());
+        }
+
+        self.device
+            .seek(SeekFrom::Start(sector_num * sector_size))?;
+        let mut sector = vec![0; sector_size as usize];
+
+        self.device.read_exact(&mut sector)?;
+
+        let iv = sector_num - (self.active_segment.offset / sector_size);
+        // the iv isn't the index of sector_size sectors, but instead the index of 512-byte sectors
+        let iv = iv * (sector_size / 512);
+        let iv = get_tweak_default((iv + iv_tweak) as u128);
+        let master_key = &self.master_key;
+        match encryption {
+            Encryption::AesXtsPlain64 => match master_key.expose_secret().0.len() {
+                32 => {
+                    let key1 = Aes128::new_from_slice(&master_key.expose_secret().0[..16]).unwrap();
+                    let key2 = Aes128::new_from_slice(&master_key.expose_secret().0[16..]).unwrap();
+                    let xts = Xts128::<Aes128>::new(key1, key2);
+                    xts.decrypt_sector(&mut sector, iv);
+                }
+                64 => {
+                    let key1 = Aes256::new_from_slice(&master_key.expose_secret().0[..32]).unwrap();
+                    let key2 = Aes256::new_from_slice(&master_key.expose_secret().0[32..]).unwrap();
+                    let xts = Xts128::<Aes256>::new(key1, key2);
+                    xts.decrypt_sector(&mut sector, iv);
+                }
+                _ => unreachable!("validated in from_device_internal"),
+            },
+            Encryption::Unknown(_) => unreachable!("validated in from_device_internal"),
+        }
+
+        self.current_sector = Cursor::new(sector);
+        self.current_sector_num = sector_num;
+
+        Ok(())
+    }
+}
+
+impl<T: Read + Seek> Read for LuksDevice<T> {
+    fn read(&mut self, buf: &mut [u8]) -> acid_io::Result<usize> {
+        let Segment {
+            type_data: SegmentTypeData::Crypt { sector_size, .. },
+            ..
+        } = &self.active_segment;
+        if self.current_sector.position() == sector_size.as_u64() {
+            self.go_to_sector(self.current_sector_num + 1)?;
+        }
+
+        self.current_sector.read(buf)
+    }
+}
+
+impl<T: Read + Seek> Seek for LuksDevice<T> {
+    fn seek(&mut self, pos: SeekFrom) -> acid_io::Result<u64> {
+        let Segment {
+            type_data: SegmentTypeData::Crypt { sector_size, .. },
+            ..
+        } = &self.active_segment;
+        let sector_size = sector_size.as_u64();
+        let offset = match pos {
+            SeekFrom::Start(p) => self.active_segment.offset + p,
+            SeekFrom::End(p) => {
+                let p = max(0, p); // limit p to non-positive values (for p > 0 we seek to the end)
+                let offset = (self.active_segment.offset as i64
+                    + self.active_segment_size as i64
+                    + p) as u64;
+                if offset < self.active_segment.offset {
+                    return Err(acid_io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "tried to seek to negative sector",
+                    ));
+                }
+                offset
+            }
+            SeekFrom::Current(p) => {
+                let current_offset =
+                    self.current_sector_num * sector_size + self.current_sector.position();
+                let offset = (current_offset as i64 + p) as u64;
+                if offset < self.active_segment.offset {
+                    return Err(acid_io::Error::new(
+                        ErrorKind::InvalidInput,
+                        "tried to seek to negative sector",
+                    ));
+                }
+                offset
+            }
+        };
+        let sector = offset / sector_size;
+        self.go_to_sector(sector)?;
+        self.current_sector
+            .seek(SeekFrom::Start(offset % sector_size))?;
+
+        Ok(self.current_sector_num * sector_size + self.current_sector.position())
     }
 }

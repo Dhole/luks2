@@ -107,11 +107,14 @@ pub enum LuksError {
     #[error("Unsupported key size: {0}")]
     UnsupportedKeySize(u32),
 
-    #[error("Unsupported key size: {0}")]
-    UnsupportedKeySize2(usize),
+    #[error("Unsupported key size for {0} encryption: {1}")]
+    UnsupportedKeySize2(&'static str, usize),
 
     #[error("Unsupported area encryption: {0}")]
     UnsupportedAreaEncryption(String),
+
+    #[error("Unsupported segment encryption: {0}")]
+    UnsupportedSegmentEncryption(String),
 
     #[error("Could not deserialize base64: {0}")]
     Base64Error(#[from] base64::DecodeError),
@@ -121,6 +124,9 @@ pub enum LuksError {
 
     #[error("Invalid key length: {0}. Valid lengths are 32 for AES-128-XTS or 64 for AES-256-XTS")]
     InvalidKeyLength(usize),
+
+    #[error("Invalid segment size: {segment_size} not multiple of sector size: {sector_size}")]
+    InvalidSegmentSize { segment_size: u64, sector_size: u64 },
 
     #[cfg(feature = "std")]
     #[error("Error during password input: {0}")]
