@@ -363,7 +363,7 @@ pub enum AreaTypeData {
     Raw {
         /// The area encryption algorithm, in dm-crypt notation (e. g. "aes-xts-plain64").
         encryption: Encryption,
-        /// The area encryption key size.
+        /// The area encryption key size, in bytes.
         key_size: usize,
     },
 }
