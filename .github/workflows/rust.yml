@@ -20,6 +20,7 @@ jobs:
       run: RUSTFLAGS="-C target-feature=+aes" cargo build --verbose
     - name: Install dependencies
       run: |
+        sudo chown $(whoami) /dev/kvm
         sudo apt update
         sudo apt install -y qemu-system-x86 xorriso ncat bzip2
     - name: Test data setup
