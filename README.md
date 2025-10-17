@@ -8,6 +8,10 @@ Interact with (currently: read metadata and data from) LUKS2 partitions from Rus
 Build with `RUSTFLAGS="-C target-feature=+aes"` to use the AES processor instruction set (if
 available on your platform).
 
+## Tests
+
+See the [Test framework README](./test-data/README.md)
+
 ## Changes compared to original
 
 From https://github.com/oberien/luks2
@@ -21,6 +25,8 @@ From https://github.com/oberien/luks2
 * add sha1 support
 
 From https://github.com/Dhole/luks2
-* run `cargo fmt`
-* simplify `LuksHeader` `Display` & `Debug`
+* rewrite the types to make it easier for encoding and serialization
+* fix some bugs
+* probably add some bugs as well
 * implement header checksum verification
+* add a testing framework to validate the implementation against the cryptsetup implementation
