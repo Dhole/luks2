@@ -11,6 +11,14 @@ impl<'a> Debug for ByteStr<'a> {
         for b in self.0 {
             if b.is_ascii_graphic() {
                 write!(f, "{}", char::from(*b))?;
+            } else if *b == b'\t' {
+                write!(f, "\\t")?;
+            } else if *b == b'\n' {
+                write!(f, "\\n")?;
+            } else if *b == b'\r' {
+                write!(f, "\\r")?;
+            } else if *b == b' ' {
+                write!(f, " ")?;
             } else {
                 write!(f, "\\x{:02x}", b)?;
             }

@@ -1,0 +1,3 @@
+[submodule "test-data/quick-vm"]
+	path = test-data/quick-vm
+	url = git@github.com:Dhole/quick-vm.git

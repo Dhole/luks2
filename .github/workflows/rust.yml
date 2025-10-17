@@ -18,9 +18,17 @@ jobs:
     - uses: actions/checkout@v3
     - name: Build
       run: RUSTFLAGS="-C target-feature=+aes" cargo build --verbose
-    - name: Generates test.iso
+    - name: Install dependencies
       run: |
-        sudo apt install cryptsetup
-        ./mk_test_iso.sh
-    - name: Run tests
-      run: cargo test --verbose
+        sudo apt update
+        sudo apt install -y qemu-system-x86 xorriso ncat bzip2
+    - name: Test data setup
+      run: |
+        cd test-data
+        ./setup.sh
+    - name: mk-img-test-luks-pg100
+      run: |
+        cd test-data
+        ./mk-img-test-luks-pg100.sh
+    - name: Test luks-pg100
+      run: cargo test --test test_img_luks_pg100

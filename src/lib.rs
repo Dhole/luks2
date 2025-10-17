@@ -21,7 +21,7 @@ pub mod utils;
 
 use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::{
-    cmp::max,
+    cmp::min,
     convert::TryFrom,
     fmt::{Debug, Display},
     str::FromStr,
@@ -679,6 +679,12 @@ pub struct Segment {
     flags: Vec<String>,
 }
 
+impl Segment {
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+}
+
 #[derive(Debug, PartialOrd, Eq, Ord, Deserialize, PartialEq, Serialize)]
 pub struct Index(#[serde(with = "type_str")] pub usize);
 
@@ -1272,7 +1278,7 @@ impl<T: Read + Seek> Seek for LuksDevice<T> {
         let offset = match pos {
             SeekFrom::Start(p) => self.active_segment.offset + p,
             SeekFrom::End(p) => {
-                let p = max(0, p); // limit p to non-positive values (for p > 0 we seek to the end)
+                let p = min(0, p); // limit p to non-positive values (for p > 0 we seek to the end)
                 let offset = (self.active_segment.offset as i64
                     + self.active_segment_size as i64
                     + p) as u64;
