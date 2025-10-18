@@ -18,4 +18,9 @@ $SSH mkdir -p /tmp/test-luks
 $SCP ../vm-scripts/mk-img-test-luks-pg100.sh $VM:/tmp/test-luks
 $SCP ../pg100.txt $VM:/tmp/test-luks
 $SSH /tmp/test-luks/mk-img-test-luks-pg100.sh
-$SCP $VM:/tmp/test-luks/test-luks-pg100.img ..
+$SCP $VM:/tmp/test-luks/test-luks-pg100.0.img ..
+$SCP $VM:/tmp/test-luks/test-luks-pg100.1.img ..
+$SCP $VM:/tmp/test-luks/test-luks-pg100.2.img ..
+$SCP $VM:/tmp/test-luks/test-luks-pg100.3.img ..
+$SCP $VM:/tmp/test-luks/test-luks-pg100.4.img ..
+$SCP $VM:/tmp/test-luks/test-luks-pg100.5.img ..
