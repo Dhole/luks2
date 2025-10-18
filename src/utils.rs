@@ -51,7 +51,7 @@ pub struct Bytes<'a>(pub &'a [u8]);
 impl<'a> Debug for Bytes<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         for b in self.0 {
-            write!(f, "{:02x}", *b)?;
+            write!(f, "{:02x} ", *b)?;
         }
         Ok(())
     }
