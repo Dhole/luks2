@@ -30,7 +30,7 @@ use core::{
 use crate::error::{EncodeError, LuksError, ParseError};
 use crate::utils::{ascii_cstr_to_str, ascii_cstr_to_string, str_to_ascii_array};
 
-use acid_io::{self, Cursor, ErrorKind, Read, Seek, SeekFrom};
+use acid_io::{self, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
 use aes::{cipher::KeyInit, Aes128, Aes256};
 use bincode::{Decode, Encode};
 use crypto_common::Output;
@@ -130,7 +130,7 @@ impl Checksum {
 
 /// Section 2.1
 #[derive(Debug, Clone)]
-pub struct BinHeader {
+pub struct HeaderBin {
     pub magic: Magic,
     /// header size plus JSON area in bytes
     pub hdr_size: u64,
@@ -149,7 +149,7 @@ pub struct BinHeader {
     pub hdr_offset: u64,
 }
 
-impl Display for BinHeader {
+impl Display for HeaderBin {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         writeln!(f, "Luks BinHeader:")?;
         writeln!(f, "\tlocation: {:?}", self.magic)?;
@@ -166,9 +166,9 @@ impl Display for BinHeader {
     }
 }
 
-impl TryFrom<&BinHeader> for BinHeaderRaw {
+impl TryFrom<&HeaderBin> for BinHeaderRaw {
     type Error = EncodeError;
-    fn try_from(h: &BinHeader) -> Result<Self, Self::Error> {
+    fn try_from(h: &HeaderBin) -> Result<Self, Self::Error> {
         fn opt_string_to_str(s: &Option<String>) -> &str {
             s.as_ref().map(|s| s.as_str()).unwrap_or("")
         }
@@ -191,7 +191,7 @@ impl TryFrom<&BinHeader> for BinHeaderRaw {
     }
 }
 
-impl TryFrom<&BinHeaderRaw> for BinHeader {
+impl TryFrom<&BinHeaderRaw> for HeaderBin {
     type Error = ParseError;
     fn try_from(h: &BinHeaderRaw) -> Result<Self, Self::Error> {
         // check header version
@@ -773,7 +773,7 @@ pub struct Token {
 /// [here](https://gitlab.com/cryptsetup/LUKS2-docs/blob/master/luks2_doc_wip.pdf).
 /// Section 3
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
-pub struct JsonHeader {
+pub struct HeaderJson {
     /// Objects describing encrypted keys storage areas.
     #[serde(with = "list")]
     pub keyslots: Vec<Keyslot>,
@@ -791,7 +791,7 @@ pub struct JsonHeader {
     pub config: Config,
 }
 
-impl Display for JsonHeader {
+impl Display for HeaderJson {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(
             f,
@@ -801,7 +801,7 @@ impl Display for JsonHeader {
     }
 }
 
-impl JsonHeader {
+impl HeaderJson {
     /// Attempt to read a LUKS2 JSON area from a reader. The reader must contain exactly the JSON data
     /// and nothing more.
     pub fn from_slice(slice: &[u8]) -> Result<Self, ParseError> {
@@ -830,10 +830,129 @@ impl JsonHeader {
     }
 }
 
+// tries to decrypt the specified keyslot using the given password
+// if successful, returns the master key
+fn decrypt_keyslot<T: Read + Seek>(
+    device: &mut T,
+    digest: &Digest,
+    keyslot: &Keyslot,
+    password: &[u8],
+) -> Result<SecretMasterKey, LuksError>
+where
+    T: Read + Seek,
+{
+    let keyslot_area = &keyslot.area;
+    let AreaTypeData::Raw {
+        encryption: keyslot_area_encryption,
+        key_size: keyslot_area_key_size,
+    } = &keyslot_area.type_data;
+    let KeyslotTypeData::Luks2 {
+        kdf: keyslot_kdf,
+        af:
+            Af::Luks1 {
+                stripes: keyslot_af_stripes,
+                hash: keyslot_af_hash,
+            },
+    } = &keyslot.type_data;
+
+    // read area of keyslot
+    let mut k = vec![0; keyslot.key_size * keyslot_af_stripes.as_usize()];
+    device.seek(SeekFrom::Start(keyslot_area.offset))?;
+    device.read_exact(&mut k)?;
+
+    // compute master key as hash of password
+    let mut pw_hash = vec![0; *keyslot_area_key_size];
+    match &keyslot_kdf.type_data {
+        KdfTypeData::Argon2i { time, memory, cpus } => {
+            let params = argon2::Params::new(*memory, *time, *cpus, Some(*keyslot_area_key_size))?;
+            let algorithm = argon2::Algorithm::Argon2i;
+            let argon = argon2::Argon2::new(algorithm, argon2::Version::V0x13, params);
+            argon.hash_password_into(password, &keyslot_kdf.salt, &mut pw_hash)?;
+        }
+        KdfTypeData::Argon2id { time, memory, cpus } => {
+            let params = argon2::Params::new(*memory, *time, *cpus, Some(*keyslot_area_key_size))?;
+            let algorithm = argon2::Algorithm::Argon2id;
+            let argon = argon2::Argon2::new(algorithm, argon2::Version::V0x13, params);
+            argon.hash_password_into(password, &keyslot_kdf.salt, &mut pw_hash)?;
+        }
+        KdfTypeData::Pbkdf2 { hash, iterations } => {
+            let kdf_fn = match hash {
+                Hash::Sha256 => pbkdf2::<Hmac<Sha256>>,
+                Hash::Sha1 => pbkdf2::<Hmac<Sha1>>,
+                Hash::Unknown(h) => return Err(LuksError::UnsupportedPbkdf2Hash(h.clone())),
+            };
+            kdf_fn(password, &keyslot_kdf.salt, *iterations, &mut pw_hash);
+        }
+    }
+
+    // make pw_hash a secret after hashing
+    let pw_hash = Secret::new(pw_hash);
+
+    // decrypt keyslot area using the password hash as key
+    match keyslot_area_encryption {
+        Encryption::AesXtsPlain64 => match keyslot_area_key_size {
+            32 => {
+                let key1 = Aes128::new_from_slice(&pw_hash.expose_secret()[..16]).unwrap();
+                let key2 = Aes128::new_from_slice(&pw_hash.expose_secret()[16..]).unwrap();
+                let xts = Xts128::<Aes128>::new(key1, key2);
+                xts.decrypt_area(&mut k, LUKS_SECTOR_SIZE, 0, get_tweak_default);
+            }
+            64 => {
+                let key1 = Aes256::new_from_slice(&pw_hash.expose_secret()[..32]).unwrap();
+                let key2 = Aes256::new_from_slice(&pw_hash.expose_secret()[32..]).unwrap();
+                let xts = Xts128::<Aes256>::new(key1, key2);
+                xts.decrypt_area(&mut k, LUKS_SECTOR_SIZE, 0, get_tweak_default);
+            }
+            x => return Err(LuksError::UnsupportedKeySize("aes-xts-plain64", *x)),
+        },
+        Encryption::Unknown(e) => return Err(LuksError::UnsupportedAreaEncryption(e.clone())),
+    }
+    // make k a secret after decryption
+    let k = Secret::new(k);
+    // merge and hash master key
+    let master_key = match keyslot_af_hash {
+        Hash::Sha256 => Secret::new(MasterKey(af::merge::<Sha256>(
+            &k.expose_secret(),
+            keyslot.key_size,
+            keyslot_af_stripes.as_usize(),
+        ))),
+        Hash::Sha1 => Secret::new(MasterKey(af::merge::<Sha1>(
+            &k.expose_secret(),
+            keyslot.key_size,
+            keyslot_af_stripes.as_usize(),
+        ))),
+        Hash::Unknown(h) => return Err(LuksError::UnsupportedAfHash(h.clone())),
+    };
+
+    let DigestTypeData::Pbkdf2 {
+        hash: digest_hash,
+        iterations: digest_iterations,
+    } = &digest.type_data;
+    let mut digest_computed = vec![0; digest.digest.len()];
+    let kdf_fn = match digest_hash {
+        Hash::Sha256 => pbkdf2::<Hmac<Sha256>>,
+        Hash::Sha1 => pbkdf2::<Hmac<Sha1>>,
+        Hash::Unknown(h) => return Err(LuksError::UnsupportedDigestHash(h.clone())),
+    };
+    kdf_fn(
+        &master_key.expose_secret().0,
+        &digest.salt,
+        *digest_iterations,
+        &mut digest_computed,
+    );
+
+    // compare digests
+    if digest_computed == digest.digest {
+        Ok(master_key)
+    } else {
+        Err(LuksError::InvalidPassword)
+    }
+}
+
 #[derive(Debug)]
 pub struct Header {
-    bin: BinHeader,
-    json: JsonHeader,
+    bin: HeaderBin,
+    json: HeaderJson,
 }
 
 impl Display for Header {
@@ -849,20 +968,44 @@ impl Header {
         let mut bin_header_bytes = vec![0; LUKS_BIN_HEADER_LEN];
         r.read_exact(&mut bin_header_bytes)?;
         let bin_header_raw = BinHeaderRaw::from_slice(&bin_header_bytes)?;
-        let bin_header = BinHeader::try_from(&bin_header_raw)?;
+        let bin_header = HeaderBin::try_from(&bin_header_raw)?;
         let mut json_header_bytes = vec![0; bin_header.hdr_size as usize - LUKS_BIN_HEADER_LEN];
         r.read_exact(&mut json_header_bytes)?;
         Self::verify_checksum(&bin_header, &json_header_bytes)?;
         let json_header_str = ascii_cstr_to_str("json_header", &json_header_bytes)?;
-        let json_header = JsonHeader::from_slice(&json_header_str.as_bytes())?;
+        let json_header = HeaderJson::from_slice(&json_header_str.as_bytes())?;
         Ok(Self {
             bin: bin_header,
             json: json_header,
         })
     }
 
+    fn verify_checksum_generic<H: digest::Digest>(
+        csum: &Output<H>,
+        bin_header: &HeaderBin,
+        json_area_bytes: &[u8],
+    ) -> Result<(), ParseError> {
+        let result = Self::calculate_checksum_generic::<H>(bin_header, json_area_bytes);
+        if &result != csum {
+            let (mut calculated, mut found) = ([0; CSUM_LEN], [0; CSUM_LEN]);
+            calculated[..result.len()].copy_from_slice(&result);
+            found[..csum.len()].copy_from_slice(&csum);
+            Err(ParseError::InvalidChecksum { calculated, found })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn verify_checksum(bin_header: &HeaderBin, json_area_bytes: &[u8]) -> Result<(), ParseError> {
+        match bin_header.checksum {
+            Checksum::Sha256(ref csum) => {
+                Self::verify_checksum_generic::<Sha256>(csum, &bin_header, json_area_bytes)
+            }
+        }
+    }
+
     fn calculate_checksum_generic<H: digest::Digest>(
-        bin_header: &BinHeader,
+        bin_header: &HeaderBin,
         json_area_bytes: &[u8],
     ) -> Output<H> {
         let mut bin_header_raw = BinHeaderRaw::try_from(bin_header).expect("valid roundtrip");
@@ -877,112 +1020,98 @@ impl Header {
         hasher.update(json_area_bytes);
         hasher.finalize()
     }
-
-    fn verify_checksum_generic<H: digest::Digest>(
-        csum: &Output<H>,
-        bin_header: &BinHeader,
-        json_area_bytes: &[u8],
-    ) -> Result<(), ParseError> {
-        let result = Self::calculate_checksum_generic::<H>(bin_header, json_area_bytes);
-        if &result != csum {
-            let (mut calculated, mut found) = ([0; CSUM_LEN], [0; CSUM_LEN]);
-            calculated[..result.len()].copy_from_slice(&result);
-            found[..csum.len()].copy_from_slice(&csum);
-            Err(ParseError::InvalidChecksum { calculated, found })
-        } else {
-            Ok(())
-        }
-    }
-
-    fn verify_checksum(bin_header: &BinHeader, json_area_bytes: &[u8]) -> Result<(), ParseError> {
-        match bin_header.checksum {
-            Checksum::Sha256(ref csum) => {
-                Self::verify_checksum_generic::<Sha256>(csum, &bin_header, json_area_bytes)
-            }
-        }
-    }
 }
 
-#[derive(Clone)]
-pub struct MasterKey(Vec<u8>);
-
-impl Zeroize for MasterKey {
-    fn zeroize(&mut self) {
-        self.0.zeroize()
-    }
-}
-
-impl DebugSecret for MasterKey {}
-
-impl CloneableSecret for MasterKey {}
-
-pub type SecretMasterKey = Secret<MasterKey>;
-
-const LUKS_SECTOR_SIZE: usize = 512;
-
-/// A struct representing a LUKS device.
-/// WARNING: this struct internally stores the master key in *user-space* RAM. Please consider the
-/// security implications this may have.
 #[derive(Debug)]
-pub struct LuksDevice<T: Read + Seek> {
+pub struct LuksDevice<T: Read + Write + Seek> {
     device: T,
     header: Header,
-    master_key: SecretMasterKey,
-    current_sector: Cursor<Vec<u8>>,
-    current_sector_num: u64,
-    // /// The header read from the device.
-    // pub header: BinHeaderRaw,
-    // /// The JSON section read from the device.
-    // pub json: LuksJson,
-    // /// The sector size of the device.
-    // pub sector_size: usize,
-    active_segment_size: u64,
-    // /// The segment used when reading from the device. Defaults to segment 0. Calls to `seek()` will
-    // /// be considered relative to `active_segment.offset()` if seeking from the start or `active_segment.size()`
-    // /// if seeking from the end.
-    pub active_segment: Segment,
 }
 
-enum PasswordOrMasterKey<'a> {
-    Password(&'a [u8]),
-    MasterKey(SecretMasterKey),
+impl<T: Read + Write + Seek> Display for LuksDevice<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        Display::fmt(&self.header, f)
+    }
 }
 
-impl<T: Read + Seek> LuksDevice<T> {
-    /// Creates a `LuksDevice` from a device (i. e. any type that implements [`Read`] and [`Seek`]).
-    pub fn from_device(device: T, password: &[u8]) -> Result<Self, LuksError> {
-        Self::from_device_internal(device, PasswordOrMasterKey::Password(password))
-    }
-
-    pub fn from_device_with_master_key(
-        device: T,
-        master_key: SecretMasterKey,
-    ) -> Result<Self, LuksError> {
-        Self::from_device_internal(device, PasswordOrMasterKey::MasterKey(master_key))
-    }
-
-    fn from_device_internal(
-        mut device: T,
-        password_or_master_key: PasswordOrMasterKey,
-    ) -> Result<Self, LuksError> {
+impl<T: Read + Write + Seek> LuksDevice<T> {
+    pub fn from_device(mut device: T) -> Result<Self, LuksError> {
         let header = Header::from_reader(&mut device)?;
+        Ok(Self { device, header })
+    }
 
+    // tries to decrypt the master key with the given password by trying all available keyslots
+    fn decrypt_master_key(
+        device: &mut T,
+        digest: &Digest,
+        keyslots: &[Keyslot],
+        password: &[u8],
+    ) -> Result<SecretMasterKey, LuksError> {
+        let mut keyslots: Vec<&Keyslot> = keyslots.iter().collect();
+        keyslots.sort_by_key(|&ks| ks.priority.unwrap_or_default());
+
+        for ks in keyslots.iter().rev() {
+            // reverse to get highest priority first
+            match decrypt_keyslot(device, digest, ks, password) {
+                Ok(mk) => return Ok(mk),
+                Err(e) => match e {
+                    LuksError::InvalidPassword => {}
+                    _ => return Err(e),
+                },
+            }
+        }
+
+        Err(LuksError::InvalidPassword)
+    }
+
+    /// Creates a `LuksActiveDevice` from the first segment described in the headers.
+    pub fn activate(
+        self,
+        write: bool,
+        password: &[u8],
+    ) -> Result<LuksActiveDevice<T>, (Self, LuksError)> {
+        self.activate_internal(write, PasswordOrMasterKey::Password(password))
+    }
+
+    pub fn activate_with_master_key(
+        self,
+        write: bool,
+        master_key: SecretMasterKey,
+    ) -> Result<LuksActiveDevice<T>, (Self, LuksError)> {
+        self.activate_internal(write, PasswordOrMasterKey::MasterKey(master_key))
+    }
+
+    fn try_activate(
+        &mut self,
+        password_or_master_key: PasswordOrMasterKey,
+    ) -> Result<(SecretMasterKey, Segment, u64), LuksError> {
         let master_key = match password_or_master_key {
             PasswordOrMasterKey::Password(password) => {
                 // Data validation
-                if header.json.keyslots.len() == 0 {
+                if self.header.json.keyslots.len() == 0 {
                     return Err(LuksError::NoKeyslots);
                 }
-                let digest = header.json.digests.get(0).ok_or(LuksError::NoDigests)?;
+                let digest = self
+                    .header
+                    .json
+                    .digests
+                    .get(0)
+                    .ok_or(LuksError::NoDigests)?;
                 if !digest.segments.contains(&Index(0)) {
                     return Err(LuksError::NoDigestsSegment0);
                 }
-                Self::decrypt_master_key(&mut device, digest, &header.json.keyslots, password)?
+                Self::decrypt_master_key(
+                    &mut self.device,
+                    digest,
+                    &self.header.json.keyslots,
+                    password,
+                )?
             }
             PasswordOrMasterKey::MasterKey(master_key) => master_key,
         };
 
-        let active_segment = header
+        let active_segment = self
+            .header
             .json
             .segments
             .get(0)
@@ -992,7 +1121,7 @@ impl<T: Read + Seek> LuksDevice<T> {
         let active_segment_size = match active_segment.size {
             SegmentSize::Fixed(s) => s,
             SegmentSize::Dynamic => {
-                let end = device.seek(SeekFrom::End(0))?;
+                let end = self.device.seek(SeekFrom::End(0))?;
                 end - active_segment.offset
             }
         };
@@ -1024,168 +1153,87 @@ impl<T: Read + Seek> LuksDevice<T> {
             }
         }
 
-        let mut d = Self {
-            device,
-            header,
+        Ok((master_key, active_segment, active_segment_size))
+    }
+
+    fn activate_internal(
+        mut self,
+        write: bool,
+        password_or_master_key: PasswordOrMasterKey,
+    ) -> Result<LuksActiveDevice<T>, (Self, LuksError)> {
+        let (master_key, active_segment, active_segment_size) =
+            match self.try_activate(password_or_master_key) {
+                Ok(ok) => ok,
+                Err(e) => return Err((self, e)),
+            };
+
+        let mut d = LuksActiveDevice {
+            device: self.device,
+            header: self.header,
+            write,
             master_key,
+            segment_size: active_segment_size,
+            segment: active_segment,
             current_sector: Cursor::new(vec![0; 256]),
             current_sector_num: u64::MAX,
-            active_segment_size,
-            active_segment,
+            dirty: false,
         };
-        d.seek(SeekFrom::Start(0))?;
-
-        Ok(d)
-    }
-
-    // tries to decrypt the master key with the given password by trying all available keyslots
-    fn decrypt_master_key(
-        device: &mut T,
-        digest: &Digest,
-        keyslots: &[Keyslot],
-        password: &[u8],
-    ) -> Result<SecretMasterKey, LuksError>
-    where
-        T: Read + Seek,
-    {
-        let mut keyslots: Vec<&Keyslot> = keyslots.iter().collect();
-        keyslots.sort_by_key(|&ks| ks.priority.unwrap_or_default());
-
-        for ks in keyslots.iter().rev() {
-            // reverse to get highest priority first
-            match Self::decrypt_keyslot(device, digest, ks, password) {
-                Ok(mk) => return Ok(mk),
-                Err(e) => match e {
-                    LuksError::InvalidPassword => {}
-                    _ => return Err(e),
-                },
-            }
-        }
-
-        Err(LuksError::InvalidPassword)
-    }
-
-    // tries to decrypt the specified keyslot using the given password
-    // if successful, returns the master key
-    fn decrypt_keyslot(
-        device: &mut T,
-        digest: &Digest,
-        keyslot: &Keyslot,
-        password: &[u8],
-    ) -> Result<SecretMasterKey, LuksError>
-    where
-        T: Read + Seek,
-    {
-        let keyslot_area = &keyslot.area;
-        let AreaTypeData::Raw {
-            encryption: keyslot_area_encryption,
-            key_size: keyslot_area_key_size,
-        } = &keyslot_area.type_data;
-        let KeyslotTypeData::Luks2 {
-            kdf: keyslot_kdf,
-            af:
-                Af::Luks1 {
-                    stripes: keyslot_af_stripes,
-                    hash: keyslot_af_hash,
-                },
-        } = &keyslot.type_data;
-
-        // read area of keyslot
-        let mut k = vec![0; keyslot.key_size * keyslot_af_stripes.as_usize()];
-        device.seek(SeekFrom::Start(keyslot_area.offset))?;
-        device.read_exact(&mut k)?;
-
-        // compute master key as hash of password
-        let mut pw_hash = vec![0; *keyslot_area_key_size];
-        match &keyslot_kdf.type_data {
-            KdfTypeData::Argon2i { time, memory, cpus } => {
-                let params =
-                    argon2::Params::new(*memory, *time, *cpus, Some(*keyslot_area_key_size))?;
-                let algorithm = argon2::Algorithm::Argon2i;
-                let argon = argon2::Argon2::new(algorithm, argon2::Version::V0x13, params);
-                argon.hash_password_into(password, &keyslot_kdf.salt, &mut pw_hash)?;
-            }
-            KdfTypeData::Argon2id { time, memory, cpus } => {
-                let params =
-                    argon2::Params::new(*memory, *time, *cpus, Some(*keyslot_area_key_size))?;
-                let algorithm = argon2::Algorithm::Argon2id;
-                let argon = argon2::Argon2::new(algorithm, argon2::Version::V0x13, params);
-                argon.hash_password_into(password, &keyslot_kdf.salt, &mut pw_hash)?;
-            }
-            KdfTypeData::Pbkdf2 { hash, iterations } => {
-                let kdf_fn = match hash {
-                    Hash::Sha256 => pbkdf2::<Hmac<Sha256>>,
-                    Hash::Sha1 => pbkdf2::<Hmac<Sha1>>,
-                    Hash::Unknown(h) => return Err(LuksError::UnsupportedPbkdf2Hash(h.clone())),
-                };
-                kdf_fn(password, &keyslot_kdf.salt, *iterations, &mut pw_hash);
-            }
-        }
-
-        // make pw_hash a secret after hashing
-        let pw_hash = Secret::new(pw_hash);
-
-        // decrypt keyslot area using the password hash as key
-        match keyslot_area_encryption {
-            Encryption::AesXtsPlain64 => match keyslot_area_key_size {
-                32 => {
-                    let key1 = Aes128::new_from_slice(&pw_hash.expose_secret()[..16]).unwrap();
-                    let key2 = Aes128::new_from_slice(&pw_hash.expose_secret()[16..]).unwrap();
-                    let xts = Xts128::<Aes128>::new(key1, key2);
-                    xts.decrypt_area(&mut k, LUKS_SECTOR_SIZE, 0, get_tweak_default);
-                }
-                64 => {
-                    let key1 = Aes256::new_from_slice(&pw_hash.expose_secret()[..32]).unwrap();
-                    let key2 = Aes256::new_from_slice(&pw_hash.expose_secret()[32..]).unwrap();
-                    let xts = Xts128::<Aes256>::new(key1, key2);
-                    xts.decrypt_area(&mut k, LUKS_SECTOR_SIZE, 0, get_tweak_default);
-                }
-                x => return Err(LuksError::UnsupportedKeySize("aes-xts-plain64", *x)),
-            },
-            Encryption::Unknown(e) => return Err(LuksError::UnsupportedAreaEncryption(e.clone())),
-        }
-        // make k a secret after decryption
-        let k = Secret::new(k);
-        // merge and hash master key
-        let master_key = match keyslot_af_hash {
-            Hash::Sha256 => Secret::new(MasterKey(af::merge::<Sha256>(
-                &k.expose_secret(),
-                keyslot.key_size,
-                keyslot_af_stripes.as_usize(),
-            ))),
-            Hash::Sha1 => Secret::new(MasterKey(af::merge::<Sha1>(
-                &k.expose_secret(),
-                keyslot.key_size,
-                keyslot_af_stripes.as_usize(),
-            ))),
-            Hash::Unknown(h) => return Err(LuksError::UnsupportedAfHash(h.clone())),
-        };
-
-        let DigestTypeData::Pbkdf2 {
-            hash: digest_hash,
-            iterations: digest_iterations,
-        } = &digest.type_data;
-        let mut digest_computed = vec![0; digest.digest.len()];
-        let kdf_fn = match digest_hash {
-            Hash::Sha256 => pbkdf2::<Hmac<Sha256>>,
-            Hash::Sha1 => pbkdf2::<Hmac<Sha1>>,
-            Hash::Unknown(h) => return Err(LuksError::UnsupportedDigestHash(h.clone())),
-        };
-        kdf_fn(
-            &master_key.expose_secret().0,
-            &digest.salt,
-            *digest_iterations,
-            &mut digest_computed,
-        );
-
-        // compare digests
-        if digest_computed == digest.digest {
-            Ok(master_key)
-        } else {
-            Err(LuksError::InvalidPassword)
+        match d.seek(SeekFrom::Start(0)) {
+            Ok(_) => Ok(d),
+            Err(e) => Err((d.deactivate(), e.into())),
         }
     }
+}
 
+#[derive(Clone)]
+pub struct MasterKey(Vec<u8>);
+
+impl Zeroize for MasterKey {
+    fn zeroize(&mut self) {
+        self.0.zeroize()
+    }
+}
+
+impl DebugSecret for MasterKey {}
+
+impl CloneableSecret for MasterKey {}
+
+pub type SecretMasterKey = Secret<MasterKey>;
+
+const LUKS_SECTOR_SIZE: usize = 512;
+
+/// A struct representing a LUKS device.
+/// WARNING: this struct internally stores the master key in *user-space* RAM. Please consider the
+/// security implications this may have.
+#[derive(Debug)]
+pub struct LuksActiveDevice<T: Read + Write + Seek> {
+    device: T,
+    header: Header,
+    write: bool,
+    // Active fields
+    master_key: SecretMasterKey,
+    segment_size: u64,
+    /// The segment used when reading from the device. Calls to `seek()` will be considered
+    /// relative to `segment.offset` if seeking from the start or segment.size` if seeking from the
+    /// end.
+    pub segment: Segment,
+    current_sector: Cursor<Vec<u8>>,
+    current_sector_num: u64,
+    dirty: bool,
+}
+
+enum PasswordOrMasterKey<'a> {
+    Password(&'a [u8]),
+    MasterKey(SecretMasterKey),
+}
+
+impl<T: Read + Write + Seek> LuksActiveDevice<T> {
+    pub fn deactivate(self) -> LuksDevice<T> {
+        LuksDevice {
+            device: self.device,
+            header: self.header,
+        }
+    }
     // updates the internal state so that current sector is the one with the given number
     // decrypts the sector, performs boundary checks (returns an error if sector_num too small,
     // goes to last sector if sector_num too big)
@@ -1199,18 +1247,18 @@ impl<T: Read + Seek> LuksDevice<T> {
                     ..
                 },
             ..
-        } = &self.active_segment;
+        } = &self.segment;
         let sector_size = sector_size.as_u64();
         if sector_num == self.current_sector_num {
             return Ok(());
-        } else if sector_num < (self.active_segment.offset / sector_size as u64) {
+        } else if sector_num < (self.segment.offset / sector_size as u64) {
             return Err(acid_io::Error::new(
                 ErrorKind::InvalidInput,
                 "tried to seek to position before active segment",
             ));
         }
 
-        let max_sector = (self.active_segment.offset + self.active_segment_size) / sector_size - 1;
+        let max_sector = (self.segment.offset + self.segment_size) / sector_size - 1;
         if sector_num > max_sector {
             self.current_sector = Cursor::new(vec![]);
             self.current_sector_num = sector_num;
@@ -1223,7 +1271,7 @@ impl<T: Read + Seek> LuksDevice<T> {
 
         self.device.read_exact(&mut sector)?;
 
-        let iv = sector_num - (self.active_segment.offset / sector_size);
+        let iv = sector_num - (self.segment.offset / sector_size);
         // the iv isn't the index of sector_size sectors, but instead the index of 512-byte sectors
         let iv = iv * (sector_size / 512);
         let iv = get_tweak_default((iv + iv_tweak) as u128);
@@ -1254,12 +1302,12 @@ impl<T: Read + Seek> LuksDevice<T> {
     }
 }
 
-impl<T: Read + Seek> Read for LuksDevice<T> {
+impl<T: Read + Write + Seek> Read for LuksActiveDevice<T> {
     fn read(&mut self, buf: &mut [u8]) -> acid_io::Result<usize> {
         let Segment {
             type_data: SegmentTypeData::Crypt { sector_size, .. },
             ..
-        } = &self.active_segment;
+        } = &self.segment;
         if self.current_sector.position() == sector_size.as_u64() {
             self.go_to_sector(self.current_sector_num + 1)?;
         }
@@ -1268,21 +1316,19 @@ impl<T: Read + Seek> Read for LuksDevice<T> {
     }
 }
 
-impl<T: Read + Seek> Seek for LuksDevice<T> {
+impl<T: Read + Write + Seek> Seek for LuksActiveDevice<T> {
     fn seek(&mut self, pos: SeekFrom) -> acid_io::Result<u64> {
         let Segment {
             type_data: SegmentTypeData::Crypt { sector_size, .. },
             ..
-        } = &self.active_segment;
+        } = &self.segment;
         let sector_size = sector_size.as_u64();
         let offset = match pos {
-            SeekFrom::Start(p) => self.active_segment.offset + p,
+            SeekFrom::Start(p) => self.segment.offset + p,
             SeekFrom::End(p) => {
                 let p = min(0, p); // limit p to non-positive values (for p > 0 we seek to the end)
-                let offset = (self.active_segment.offset as i64
-                    + self.active_segment_size as i64
-                    + p) as u64;
-                if offset < self.active_segment.offset {
+                let offset = (self.segment.offset as i64 + self.segment_size as i64 + p) as u64;
+                if offset < self.segment.offset {
                     return Err(acid_io::Error::new(
                         ErrorKind::InvalidInput,
                         "tried to seek to negative sector",
@@ -1294,7 +1340,7 @@ impl<T: Read + Seek> Seek for LuksDevice<T> {
                 let current_offset =
                     self.current_sector_num * sector_size + self.current_sector.position();
                 let offset = (current_offset as i64 + p) as u64;
-                if offset < self.active_segment.offset {
+                if offset < self.segment.offset {
                     return Err(acid_io::Error::new(
                         ErrorKind::InvalidInput,
                         "tried to seek to negative sector",
@@ -1309,5 +1355,90 @@ impl<T: Read + Seek> Seek for LuksDevice<T> {
             .seek(SeekFrom::Start(offset % sector_size))?;
 
         Ok(self.current_sector_num * sector_size + self.current_sector.position())
+    }
+}
+
+impl<T: Read + Write + Seek> Write for LuksActiveDevice<T> {
+    fn write(&mut self, buf: &[u8]) -> acid_io::Result<usize> {
+        if !self.write {
+            return Err(acid_io::Error::new(
+                ErrorKind::Other,
+                "tried to write in read-only mode",
+            ));
+        }
+        let Segment {
+            type_data: SegmentTypeData::Crypt { sector_size, .. },
+            ..
+        } = &self.segment;
+        if self.current_sector.position() == sector_size.as_u64() {
+            self.flush()?;
+            self.go_to_sector(self.current_sector_num + 1)?;
+        }
+
+        self.dirty = true;
+        self.current_sector.write(buf)
+    }
+
+    fn flush(&mut self) -> acid_io::Result<()> {
+        if !self.dirty {
+            return Ok(());
+        }
+        if !self.write {
+            return Err(acid_io::Error::new(
+                ErrorKind::Other,
+                "tried to flush in read-only mode",
+            ));
+        }
+
+        // If the current_sector size is 0 it means we've seeked past the max_sector, so we have
+        // nothing to flush.
+        if self.current_sector.get_ref().len() == 0 {
+            self.dirty = false;
+            return Ok(());
+        }
+
+        let Segment {
+            type_data:
+                SegmentTypeData::Crypt {
+                    iv_tweak,
+                    sector_size,
+                    encryption,
+                    ..
+                },
+            ..
+        } = &self.segment;
+        let sector_size = sector_size.as_u64();
+
+        let mut sector = self.current_sector.get_ref().clone();
+
+        let iv = self.current_sector_num - (self.segment.offset / sector_size);
+        // the iv isn't the index of sector_size sectors, but instead the index of 512-byte sectors
+        let iv = iv * (sector_size / 512);
+        let iv = get_tweak_default((iv + iv_tweak) as u128);
+        let master_key = &self.master_key;
+        match encryption {
+            Encryption::AesXtsPlain64 => match master_key.expose_secret().0.len() {
+                32 => {
+                    let key1 = Aes128::new_from_slice(&master_key.expose_secret().0[..16]).unwrap();
+                    let key2 = Aes128::new_from_slice(&master_key.expose_secret().0[16..]).unwrap();
+                    let xts = Xts128::<Aes128>::new(key1, key2);
+                    xts.encrypt_sector(&mut sector, iv);
+                }
+                64 => {
+                    let key1 = Aes256::new_from_slice(&master_key.expose_secret().0[..32]).unwrap();
+                    let key2 = Aes256::new_from_slice(&master_key.expose_secret().0[32..]).unwrap();
+                    let xts = Xts128::<Aes256>::new(key1, key2);
+                    xts.encrypt_sector(&mut sector, iv);
+                }
+                _ => unreachable!("validated in from_device_internal"),
+            },
+            Encryption::Unknown(_) => unreachable!("validated in from_device_internal"),
+        }
+
+        self.device
+            .seek(SeekFrom::Start(self.current_sector_num * sector_size))?;
+        self.device.write_all(&mut sector)?;
+        self.dirty = false;
+        Ok(())
     }
 }

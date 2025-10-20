@@ -1,4 +1,4 @@
-use luks2::LuksDevice;
+use luks2::LuksActiveDevice;
 use std::{
     fs::File,
     io::{Cursor, Read},
@@ -13,7 +13,8 @@ fn main() {
         .expect("could not read from example.iso");
     let f = Cursor::new(buf);
 
-    let luks_dev = LuksDevice::from_device(f, b"password", 512).expect("could not create device");
+    let luks_dev =
+        LuksActiveDevice::from_device(f, b"password", 512).expect("could not create device");
 
     println!("{}", luks_dev.header);
     println!("{:#?}", luks_dev.json);

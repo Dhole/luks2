@@ -25,7 +25,7 @@ fn main() {
     let password = password::read().expect("could not read password");
 
     let luks_device =
-        LuksDevice::from_device(partition, password.expose_secret().as_bytes(), sector_size)
+        LuksActiveDevice::from_device(partition, password.expose_secret().as_bytes(), sector_size)
             .expect("could not create luks device");
 
     println!("{:?}", luks_device.header);

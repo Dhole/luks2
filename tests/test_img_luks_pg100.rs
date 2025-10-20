@@ -2,7 +2,7 @@
 
 use acid_io::Cursor;
 use luks2::utils::{ascii_cstr_to_str, ByteStr, Bytes};
-use luks2::{BinHeader, BinHeaderRaw, Header, JsonHeader, LuksDevice, LUKS_BIN_HEADER_LEN};
+use luks2::{BinHeaderRaw, HeaderBin, HeaderJson, LuksDevice, LUKS_BIN_HEADER_LEN};
 use std::convert::TryFrom;
 use std::{
     fs::File,
@@ -29,7 +29,7 @@ fn test_read_bin_header() {
     f.read_exact(&mut h).unwrap();
     let bin_header_raw = BinHeaderRaw::from_slice(&h).unwrap();
     println!("{:?}", bin_header_raw);
-    let bin_header = BinHeader::try_from(&bin_header_raw).unwrap();
+    let bin_header = HeaderBin::try_from(&bin_header_raw).unwrap();
     println!("{}", bin_header);
 }
 
@@ -41,7 +41,7 @@ fn test_read_json_header() {
     let mut json_header_bytes = vec![0; 16384 - LUKS_BIN_HEADER_LEN];
     f.read_exact(&mut json_header_bytes).unwrap();
     let json_header_str = ascii_cstr_to_str("json_header", &json_header_bytes).unwrap();
-    let json_header = JsonHeader::from_slice(&json_header_str.as_bytes()).unwrap();
+    let json_header = HeaderJson::from_slice(&json_header_str.as_bytes()).unwrap();
     println!("{}", json_header);
     assert_eq!(json_header.segments[0].offset(), 16 * 1024 * 1024);
 
@@ -54,7 +54,7 @@ fn test_read_json_header() {
 #[test]
 fn test_read_header() {
     let f = open_test_img(0);
-    let header = Header::from_reader(f).unwrap();
+    let header = LuksDevice::from_device(f).unwrap();
     println!("{}", header);
 }
 
@@ -62,7 +62,10 @@ fn test_read_header() {
 fn test_activate_device() {
     for i in 0..=5 {
         let f = open_test_img(i);
-        LuksDevice::from_device(f, b"password").unwrap();
+        LuksDevice::from_device(f)
+            .unwrap()
+            .activate(false, b"password")
+            .unwrap();
     }
 }
 
@@ -79,7 +82,10 @@ fn test_read_device() {
 
     for i in 0..=5 {
         let f = open_test_img(i);
-        let mut d = LuksDevice::from_device(f, b"password").unwrap();
+        let mut d = LuksDevice::from_device(f)
+            .unwrap()
+            .activate(false, b"password")
+            .unwrap();
 
         for (len, seek) in &[
             (1_000, SeekFrom::Start(0)),
