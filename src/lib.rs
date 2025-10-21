@@ -21,9 +21,9 @@ pub mod utils;
 
 use alloc::{collections::BTreeMap, string::String, vec::Vec};
 use core::{
-    cmp::min,
     convert::TryFrom,
     fmt::{Debug, Display},
+    mem,
     str::FromStr,
 };
 
@@ -356,7 +356,7 @@ impl<'de> Deserialize<'de> for Encryption {
 }
 
 /// Only the `raw` type is currently used.
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum AreaTypeData {
@@ -370,7 +370,7 @@ pub enum AreaTypeData {
 
 /// Information on the allocated area in the binary keyslots area of a [`LuksKeyslot`].
 /// Section 3.2.3
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub struct Area {
     #[serde(flatten)]
     type_data: AreaTypeData,
@@ -382,7 +382,7 @@ pub struct Area {
     size: u64,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Hash {
     Sha256,
     Sha1,
@@ -409,7 +409,7 @@ impl<'de> Deserialize<'de> for Hash {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Stripes {}
 
 impl Stripes {
@@ -439,7 +439,7 @@ impl<'de> Deserialize<'de> for Stripes {
 /// Section 3.2.4
 ///
 /// Only the `luks1` type compatible with LUKS1 is currently used.
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum Af {
@@ -452,7 +452,7 @@ pub enum Af {
 }
 
 /// Only the `raw` type is currently used.
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum KdfTypeData {
@@ -484,7 +484,7 @@ pub enum KdfTypeData {
 
 /// Stores information on the PBKDF type and parameters of a [`LuksKeyslot`].
 /// Section 3.2.5
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub struct Kdf {
     #[serde(flatten)]
     type_data: KdfTypeData,
@@ -527,7 +527,7 @@ impl<'de> Deserialize<'de> for Priority {
 }
 
 /// Section 3.2.1
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type")]
 // enum variant names must match the JSON values exactly, which are lowercase, so no CamelCase names
 #[serde(rename_all = "snake_case")]
@@ -546,7 +546,7 @@ pub enum KeyslotTypeData {
 /// Section 3.2
 ///
 /// Only the `luks2` type is currently used.
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type")]
 // enum variant names must match the JSON values exactly, which are lowercase, so no CamelCase names
 #[serde(rename_all = "snake_case")]
@@ -685,11 +685,11 @@ impl Segment {
     }
 }
 
-#[derive(Debug, PartialOrd, Eq, Ord, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialOrd, Eq, Ord, Deserialize, PartialEq, Serialize)]
 pub struct Index(#[serde(with = "type_str")] pub usize);
 
 // Section 3.4
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum DigestTypeData {
@@ -708,7 +708,7 @@ pub enum DigestTypeData {
 /// Section 3.4
 ///
 /// Only the `pbkdf2` type compatible with LUKS1 is used.
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub struct Digest {
     #[serde(flatten)]
     type_data: DigestTypeData,
@@ -724,7 +724,7 @@ pub struct Digest {
     digest: Vec<u8>,
 }
 
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Requirement {}
 
 impl<'de> Deserialize<'de> for Requirement {
@@ -738,7 +738,7 @@ impl<'de> Deserialize<'de> for Requirement {
 
 /// Global attributes for the LUKS device.
 /// Section 3.5
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub struct Config {
     /// The JSON area size in bytes. Must match the binary header.
     #[serde(with = "type_str")]
@@ -760,7 +760,7 @@ pub struct Config {
 /// It can also contain additional user-defined JSON metadata. No token types are implemented;
 /// this is only included for parsing compatibility.
 /// Section 3.6
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub struct Token {
     #[serde(rename = "type")]
     token_type: String,
@@ -772,7 +772,7 @@ pub struct Token {
 /// JSON metadata for the device as described
 /// [here](https://gitlab.com/cryptsetup/LUKS2-docs/blob/master/luks2_doc_wip.pdf).
 /// Section 3
-#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub struct HeaderJson {
     /// Objects describing encrypted keys storage areas.
     #[serde(with = "list")]
@@ -830,17 +830,19 @@ impl HeaderJson {
     }
 }
 
+pub trait ReadSeek: Read + Seek + Debug {}
+impl<T: ?Sized> ReadSeek for T where T: Read + Seek + Debug {}
+pub trait ReadWriteSeek: Read + Write + Seek + Debug {}
+impl<T: ?Sized> ReadWriteSeek for T where T: Read + Write + Seek + Debug {}
+
 // tries to decrypt the specified keyslot using the given password
 // if successful, returns the master key
-fn decrypt_keyslot<T: Read + Seek>(
-    device: &mut T,
+fn decrypt_keyslot(
+    device: &mut dyn ReadSeek,
     digest: &Digest,
     keyslot: &Keyslot,
     password: &[u8],
-) -> Result<SecretMasterKey, LuksError>
-where
-    T: Read + Seek,
-{
+) -> Result<SecretMasterKey, LuksError> {
     let keyslot_area = &keyslot.area;
     let AreaTypeData::Raw {
         encryption: keyslot_area_encryption,
@@ -949,7 +951,7 @@ where
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Header {
     bin: HeaderBin,
     json: HeaderJson,
@@ -964,7 +966,7 @@ impl Display for Header {
 }
 
 impl Header {
-    pub fn from_reader<R: Read>(mut r: R) -> Result<Self, LuksError> {
+    pub fn from_reader(r: &mut dyn Read) -> Result<Self, LuksError> {
         let mut bin_header_bytes = vec![0; LUKS_BIN_HEADER_LEN];
         r.read_exact(&mut bin_header_bytes)?;
         let bin_header_raw = BinHeaderRaw::from_slice(&bin_header_bytes)?;
@@ -1023,26 +1025,26 @@ impl Header {
 }
 
 #[derive(Debug)]
-pub struct LuksDevice<T: Read + Write + Seek> {
-    device: T,
+pub struct LuksDevice {
+    device: Box<dyn ReadWriteSeek>,
     header: Header,
 }
 
-impl<T: Read + Write + Seek> Display for LuksDevice<T> {
+impl Display for LuksDevice {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         Display::fmt(&self.header, f)
     }
 }
 
-impl<T: Read + Write + Seek> LuksDevice<T> {
-    pub fn from_device(mut device: T) -> Result<Self, LuksError> {
+impl LuksDevice {
+    pub fn from_device(mut device: Box<dyn ReadWriteSeek>) -> Result<Self, LuksError> {
         let header = Header::from_reader(&mut device)?;
         Ok(Self { device, header })
     }
 
     // tries to decrypt the master key with the given password by trying all available keyslots
     fn decrypt_master_key(
-        device: &mut T,
+        device: &mut dyn ReadSeek,
         digest: &Digest,
         keyslots: &[Keyslot],
         password: &[u8],
@@ -1069,7 +1071,7 @@ impl<T: Read + Write + Seek> LuksDevice<T> {
         self,
         write: bool,
         password: &[u8],
-    ) -> Result<LuksActiveDevice<T>, (Self, LuksError)> {
+    ) -> Result<LuksActiveDevice, (Self, LuksError)> {
         self.activate_internal(write, PasswordOrMasterKey::Password(password))
     }
 
@@ -1077,7 +1079,7 @@ impl<T: Read + Write + Seek> LuksDevice<T> {
         self,
         write: bool,
         master_key: SecretMasterKey,
-    ) -> Result<LuksActiveDevice<T>, (Self, LuksError)> {
+    ) -> Result<LuksActiveDevice, (Self, LuksError)> {
         self.activate_internal(write, PasswordOrMasterKey::MasterKey(master_key))
     }
 
@@ -1160,7 +1162,7 @@ impl<T: Read + Write + Seek> LuksDevice<T> {
         mut self,
         write: bool,
         password_or_master_key: PasswordOrMasterKey,
-    ) -> Result<LuksActiveDevice<T>, (Self, LuksError)> {
+    ) -> Result<LuksActiveDevice, (Self, LuksError)> {
         let (master_key, active_segment, active_segment_size) =
             match self.try_activate(password_or_master_key) {
                 Ok(ok) => ok,
@@ -1174,13 +1176,19 @@ impl<T: Read + Write + Seek> LuksDevice<T> {
             master_key,
             segment_size: active_segment_size,
             segment: active_segment,
-            current_sector: Cursor::new(vec![0; 256]),
+            current_sector: Cursor::new(vec![].into_boxed_slice()),
             current_sector_num: u64::MAX,
             dirty: false,
         };
         match d.seek(SeekFrom::Start(0)) {
             Ok(_) => Ok(d),
-            Err(e) => Err((d.deactivate(), e.into())),
+            Err(e) => {
+                let d = match d.deactivate() {
+                    Ok(d) => d,
+                    Err(_) => unreachable!("no write expected"),
+                };
+                Err((d, e.into()))
+            }
         }
     }
 }
@@ -1206,8 +1214,8 @@ const LUKS_SECTOR_SIZE: usize = 512;
 /// WARNING: this struct internally stores the master key in *user-space* RAM. Please consider the
 /// security implications this may have.
 #[derive(Debug)]
-pub struct LuksActiveDevice<T: Read + Write + Seek> {
-    device: T,
+pub struct LuksActiveDevice {
+    device: Box<dyn ReadWriteSeek>,
     header: Header,
     write: bool,
     // Active fields
@@ -1217,7 +1225,7 @@ pub struct LuksActiveDevice<T: Read + Write + Seek> {
     /// relative to `segment.offset` if seeking from the start or segment.size` if seeking from the
     /// end.
     pub segment: Segment,
-    current_sector: Cursor<Vec<u8>>,
+    current_sector: Cursor<Box<[u8]>>,
     current_sector_num: u64,
     dirty: bool,
 }
@@ -1227,17 +1235,29 @@ enum PasswordOrMasterKey<'a> {
     MasterKey(SecretMasterKey),
 }
 
-impl<T: Read + Write + Seek> LuksActiveDevice<T> {
-    pub fn deactivate(self) -> LuksDevice<T> {
-        LuksDevice {
-            device: self.device,
-            header: self.header,
+impl LuksActiveDevice {
+    pub fn deactivate(mut self) -> Result<LuksDevice, (Self, acid_io::Error)> {
+        match self.flush() {
+            Err(e) => return Err((self, e)),
+            Ok(()) => {}
         }
+        let mut device: Box<dyn ReadWriteSeek> = Box::new(Cursor::new(vec![]));
+        // We can't move out the device because Self implements Drop, so insetead we replace it
+        // with a dummy.  `drop` will call `flush` and return immediately because we just called
+        // `flush` making the device is not dirty.
+        mem::swap(&mut self.device, &mut device);
+        Ok(LuksDevice {
+            device,
+            header: self.header.clone(),
+        })
     }
     // updates the internal state so that current sector is the one with the given number
     // decrypts the sector, performs boundary checks (returns an error if sector_num too small,
     // goes to last sector if sector_num too big)
     fn go_to_sector(&mut self, sector_num: u64) -> acid_io::Result<()> {
+        if self.dirty {
+            self.flush()?;
+        }
         let Segment {
             type_data:
                 SegmentTypeData::Crypt {
@@ -1260,14 +1280,14 @@ impl<T: Read + Write + Seek> LuksActiveDevice<T> {
 
         let max_sector = (self.segment.offset + self.segment_size) / sector_size - 1;
         if sector_num > max_sector {
-            self.current_sector = Cursor::new(vec![]);
+            self.current_sector = Cursor::new(vec![].into_boxed_slice());
             self.current_sector_num = sector_num;
             return Ok(());
         }
 
         self.device
             .seek(SeekFrom::Start(sector_num * sector_size))?;
-        let mut sector = vec![0; sector_size as usize];
+        let mut sector = vec![0; sector_size as usize].into_boxed_slice();
 
         self.device.read_exact(&mut sector)?;
 
@@ -1302,7 +1322,7 @@ impl<T: Read + Write + Seek> LuksActiveDevice<T> {
     }
 }
 
-impl<T: Read + Write + Seek> Read for LuksActiveDevice<T> {
+impl Read for LuksActiveDevice {
     fn read(&mut self, buf: &mut [u8]) -> acid_io::Result<usize> {
         let Segment {
             type_data: SegmentTypeData::Crypt { sector_size, .. },
@@ -1316,7 +1336,7 @@ impl<T: Read + Write + Seek> Read for LuksActiveDevice<T> {
     }
 }
 
-impl<T: Read + Write + Seek> Seek for LuksActiveDevice<T> {
+impl Seek for LuksActiveDevice {
     fn seek(&mut self, pos: SeekFrom) -> acid_io::Result<u64> {
         let Segment {
             type_data: SegmentTypeData::Crypt { sector_size, .. },
@@ -1326,7 +1346,6 @@ impl<T: Read + Write + Seek> Seek for LuksActiveDevice<T> {
         let offset = match pos {
             SeekFrom::Start(p) => self.segment.offset + p,
             SeekFrom::End(p) => {
-                let p = min(0, p); // limit p to non-positive values (for p > 0 we seek to the end)
                 let offset = (self.segment.offset as i64 + self.segment_size as i64 + p) as u64;
                 if offset < self.segment.offset {
                     return Err(acid_io::Error::new(
@@ -1354,11 +1373,12 @@ impl<T: Read + Write + Seek> Seek for LuksActiveDevice<T> {
         self.current_sector
             .seek(SeekFrom::Start(offset % sector_size))?;
 
-        Ok(self.current_sector_num * sector_size + self.current_sector.position())
+        Ok(self.current_sector_num * sector_size - self.segment.offset
+            + self.current_sector.position())
     }
 }
 
-impl<T: Read + Write + Seek> Write for LuksActiveDevice<T> {
+impl Write for LuksActiveDevice {
     fn write(&mut self, buf: &[u8]) -> acid_io::Result<usize> {
         if !self.write {
             return Err(acid_io::Error::new(
@@ -1371,7 +1391,6 @@ impl<T: Read + Write + Seek> Write for LuksActiveDevice<T> {
             ..
         } = &self.segment;
         if self.current_sector.position() == sector_size.as_u64() {
-            self.flush()?;
             self.go_to_sector(self.current_sector_num + 1)?;
         }
 
@@ -1440,5 +1459,11 @@ impl<T: Read + Write + Seek> Write for LuksActiveDevice<T> {
         self.device.write_all(&mut sector)?;
         self.dirty = false;
         Ok(())
+    }
+}
+
+impl Drop for LuksActiveDevice {
+    fn drop(&mut self) {
+        let _ = self.flush();
     }
 }

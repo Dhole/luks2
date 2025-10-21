@@ -10,8 +10,6 @@ cd /tmp/test-luks
 mk_img() {
     dd if=/dev/zero bs=1M count=20 > $IMG
     # Default parameters
-    # FIXME: Fails with:
-    #   --hash sha1
     printf "password" | cryptsetup luksFormat \
         $@ \
         $IMG \

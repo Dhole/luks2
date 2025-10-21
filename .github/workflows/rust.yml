@@ -27,9 +27,16 @@ jobs:
       run: |
         cd test-data
         ./setup.sh
-    - name: mk-img-test-luks-pg100
+    - name: Test img-luks-pg100-read
       run: |
         cd test-data
         ./mk-img-test-luks-pg100.sh
-    - name: Test luks-pg100
-      run: cargo test --test test_img_luks_pg100
+        cargo test --test test_img_luks_pg100_read
+    - name: Test img-luks-pg100-write
+      run: |
+        cd test-data
+        ./mk-img-test-luks-blank.sh
+        cargo test --test test_img_luks_pg100_write test_write_device
+        cargo test --test test_img_luks_pg100_write test_read_device
+        ./decrypt-test-luks-write.sh
+        cargo test --test test_img_luks_pg100_write test_verify_decryption
