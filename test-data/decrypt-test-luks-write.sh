@@ -11,7 +11,7 @@ cd quick-vm
 
 ./start-vm.sh
 # Stop qemu on exit
-trap "$SSH doas poweroff; trap - EXIT; exit" EXIT INT HUP TERM
+trap "$SSH doas poweroff; (while [ -f qemu-pid.txt ]; do sleep 1; done); trap - EXIT; exit" EXIT INT HUP TERM
 while ! (ncat -i 1s localhost 2222 | grep SSH); do sleep 2; done
 
 $SSH mkdir -p /tmp/test-luks
