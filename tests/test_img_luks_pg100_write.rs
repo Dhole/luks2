@@ -127,7 +127,7 @@ fn test_verify_decryption() {
     );
     let mut decrypted = File::open(&decrypted_path).unwrap();
     let mut decrypted_buf = Vec::new();
-    decrypted.read_exact(&mut decrypted_buf).unwrap();
+    decrypted.read_to_end(&mut decrypted_buf).unwrap();
 
     assert_eq!(expected_buf, decrypted_buf);
 }
