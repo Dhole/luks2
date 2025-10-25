@@ -1,5 +1,6 @@
 use crate::utils::{ByteStr, Bytes};
 use crate::{CSUM_ALG_LEN, CSUM_LEN};
+use core::fmt;
 
 use alloc::string::String;
 use thiserror_no_std::Error;
@@ -15,7 +16,7 @@ pub enum EncodeError {
 }
 
 /// Enum for errors arising during parsing.
-#[derive(Debug, Error)]
+#[derive(Error)]
 pub enum ParseError {
     #[error("Deserialization error: {0}")]
     BincodeError(#[from] bincode::error::DecodeError),
@@ -75,6 +76,12 @@ pub enum ParseError {
     MissingUuid,
 }
 
+impl fmt::Debug for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
 /// Enum for errors arising during interaction with a [`LuksDevice`](crate::LuksDevice).
 #[derive(Debug, Error)]
 pub enum LuksError {
@@ -117,6 +124,9 @@ pub enum LuksError {
     #[error("Invalid segment size: {segment_size} not multiple of sector size: {sector_size}")]
     InvalidSegmentSize { segment_size: u64, sector_size: u64 },
 
+    #[error("INvalid header offset: expected 0x{expected:x} but found 0x{found:x}")]
+    InvalidHeaderOffset { expected: u64, found: u64 },
+
     #[cfg(feature = "std")]
     #[error("Error during password input: {0}")]
     PasswordError(#[from] crossterm::ErrorKind),
@@ -132,4 +142,9 @@ pub enum LuksError {
 
     #[error("No Digest for Segment 0")]
     NoDigestsSegment0,
+
+    #[error(
+        "Found existing header in device.  To format first clear the first segment of the device"
+    )]
+    FoundExistingHeader,
 }

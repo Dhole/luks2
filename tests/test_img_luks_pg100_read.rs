@@ -9,6 +9,8 @@ use std::{
     io::{Read, Seek, SeekFrom},
 };
 
+const SIZE: usize = 4 * 1024 * 1024;
+
 fn open_test_img(i: usize) -> Box<File> {
     let path = format!(
         "{}/test-data/test-luks-pg100.{}.img",
@@ -25,7 +27,7 @@ fn open_test_img(i: usize) -> Box<File> {
 #[test]
 fn test_read_bin_header() {
     let mut f = open_test_img(0);
-    let mut h = vec![0; 4096];
+    let mut h = vec![0; LUKS_BIN_HEADER_LEN];
     f.read_exact(&mut h).unwrap();
     let bin_header_raw = BinHeaderRaw::from_slice(&h).unwrap();
     println!("{:?}", bin_header_raw);
@@ -36,7 +38,7 @@ fn test_read_bin_header() {
 #[test]
 fn test_read_json_header() {
     let mut f = open_test_img(0);
-    f.seek(SeekFrom::Start(4096)).unwrap();
+    f.seek(SeekFrom::Start(LUKS_BIN_HEADER_LEN as u64)).unwrap();
 
     let mut json_header_bytes = vec![0; 16384 - LUKS_BIN_HEADER_LEN];
     f.read_exact(&mut json_header_bytes).unwrap();
@@ -77,7 +79,7 @@ fn test_read_device_ok() {
     let mut pg100 = File::open(&pg100_path).unwrap();
     let mut pg100_buf = Vec::new();
     pg100.read_to_end(&mut pg100_buf).unwrap();
-    pg100_buf.truncate(4 * 1024 * 1024);
+    pg100_buf.truncate(SIZE);
     let mut pg100 = Cursor::new(pg100_buf);
 
     for i in 0..=5 {
@@ -113,7 +115,7 @@ fn test_read_device_edge() {
     let mut pg100 = File::open(&pg100_path).unwrap();
     let mut pg100_buf = Vec::new();
     pg100.read_to_end(&mut pg100_buf).unwrap();
-    pg100_buf.truncate(4 * 1024 * 1024);
+    pg100_buf.truncate(SIZE);
     let mut pg100 = Cursor::new(pg100_buf);
 
     let f = open_test_img(0);
@@ -122,10 +124,9 @@ fn test_read_device_edge() {
         .activate(false, b"password")
         .unwrap();
 
-    let size = 4 * 1024 * 1024;
-
     let mut buf = vec![0; 128];
 
+    let size = SIZE as u64;
     // Read at the end
     let o = pg100.seek(SeekFrom::End(0)).unwrap();
     assert_eq!(size, o);

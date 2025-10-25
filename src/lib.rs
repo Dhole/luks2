@@ -26,6 +26,8 @@ use core::{
     mem,
     str::FromStr,
 };
+use rand::prelude::*;
+use uuid::Uuid;
 
 use crate::error::{EncodeError, LuksError, ParseError};
 use crate::utils::{ascii_cstr_to_str, ascii_cstr_to_string, str_to_ascii_array};
@@ -57,6 +59,7 @@ pub const CSUM_ALG_LEN: usize = 32;
 pub const CSUM_LEN: usize = 64;
 pub const LUKS_BIN_HEADER_LEN: usize = 4096;
 
+/// Pairs of secondary header offset VS JSON area size
 pub(crate) const PRIMARY_LEN_JSON_LEN: &[(usize, usize)] = &[
     (0x004000, 12 * 1024),
     (0x008000, 28 * 1024),
@@ -69,7 +72,7 @@ pub(crate) const PRIMARY_LEN_JSON_LEN: &[(usize, usize)] = &[
     (0x400000, 4092 * 1024),
 ];
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Magic {
     First,
     Second,
@@ -80,7 +83,7 @@ impl Magic {
         let mut array = [0; MAGIC_LEN];
         array.copy_from_slice(match self {
             Self::First => MAGIC_1ST,
-            Self::Second => MAGIC_1ST,
+            Self::Second => MAGIC_2ND,
         });
         array
     }
@@ -95,7 +98,7 @@ impl Magic {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Checksum {
     Sha256(Output<Sha256>),
 }
@@ -129,7 +132,7 @@ impl Checksum {
 }
 
 /// Section 2.1
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct HeaderBin {
     pub magic: Magic,
     /// header size plus JSON area in bytes
@@ -368,7 +371,7 @@ pub enum AreaTypeData {
     },
 }
 
-/// Information on the allocated area in the binary keyslots area of a [`LuksKeyslot`].
+/// Information on the allocated area in the binary keyslots area of a [`Keyslot`].
 /// Section 3.2.3
 #[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub struct Area {
@@ -433,7 +436,7 @@ impl<'de> Deserialize<'de> for Stripes {
     }
 }
 
-/// An anti-forensic splitter of a [`LuksKeyslot`]. See
+/// An anti-forensic splitter of a [`Keyslot`]. See
 /// [the LUKS1 spec](https://gitlab.com/cryptsetup/cryptsetup/wikis/Specification)
 /// for more information.
 /// Section 3.2.4
@@ -482,7 +485,7 @@ pub enum KdfTypeData {
     },
 }
 
-/// Stores information on the PBKDF type and parameters of a [`LuksKeyslot`].
+/// Stores information on the PBKDF type and parameters of a [`Keyslot`].
 /// Section 3.2.5
 #[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
 pub struct Kdf {
@@ -493,7 +496,7 @@ pub struct Kdf {
     salt: Vec<u8>,
 }
 
-/// The priority of a [`LuksKeyslot`].
+/// The priority of a [`Keyslot`].
 #[derive(Debug, Default, Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
 pub enum Priority {
     /// The slot should be used only if explicitly stated.
@@ -563,7 +566,7 @@ pub struct Keyslot {
     priority: Option<Priority>,
 }
 
-/// The size of a [`LuksSegment`].
+/// The size of a [`Segment`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum SegmentSize {
     /// Signals that the size of the underlying device should be used (dynamic resize).
@@ -618,6 +621,15 @@ impl SectorSize {
             Self::B4096 => 4096,
         }
     }
+    pub fn from_u16(v: u16) -> Result<Self, ParseError> {
+        match v {
+            512 => Ok(Self::B512),
+            1024 => Ok(Self::B1024),
+            2048 => Ok(Self::B2048),
+            4096 => Ok(Self::B4096),
+            _ => Err(ParseError::InvalidSectorSize(v)),
+        }
+    }
 }
 
 impl Serialize for SectorSize {
@@ -628,13 +640,7 @@ impl Serialize for SectorSize {
 
 impl<'de> Deserialize<'de> for SectorSize {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<SectorSize, D::Error> {
-        match u16::deserialize(deserializer)? {
-            512 => Ok(Self::B512),
-            1024 => Ok(Self::B1024),
-            2048 => Ok(Self::B2048),
-            4096 => Ok(Self::B4096),
-            s => Err(de::Error::custom(ParseError::InvalidSectorSize(s))),
-        }
+        Self::from_u16(u16::deserialize(deserializer)?).map_err(|e| de::Error::custom(e))
     }
 }
 
@@ -671,7 +677,7 @@ pub struct Segment {
     /// The offset from the device start to the beginning of the segment in bytes.
     #[serde(with = "type_str")]
     offset: u64,
-    /// The segment size, see [`LuksSegmentSize`].
+    /// The segment size, see [`SegmentSize`].
     size: SegmentSize,
     /// An array of strings marking the segment with additional information (optional).
     #[serde(default)]
@@ -835,8 +841,8 @@ impl<T: ?Sized> ReadSeek for T where T: Read + Seek + Debug {}
 pub trait ReadWriteSeek: Read + Write + Seek + Debug {}
 impl<T: ?Sized> ReadWriteSeek for T where T: Read + Write + Seek + Debug {}
 
-// tries to decrypt the specified keyslot using the given password
-// if successful, returns the master key
+// Tries to decrypt the specified keyslot using the given password if successful, returns the
+// master key
 fn decrypt_keyslot(
     device: &mut dyn ReadSeek,
     digest: &Digest,
@@ -857,25 +863,25 @@ fn decrypt_keyslot(
             },
     } = &keyslot.type_data;
 
-    // read area of keyslot
-    let mut k = vec![0; keyslot.key_size * keyslot_af_stripes.as_usize()];
+    // Read area of keyslot
+    let mut master_key_split = vec![0; keyslot.key_size * keyslot_af_stripes.as_usize()];
     device.seek(SeekFrom::Start(keyslot_area.offset))?;
-    device.read_exact(&mut k)?;
+    device.read_exact(&mut master_key_split)?;
 
-    // compute master key as hash of password
-    let mut pw_hash = vec![0; *keyslot_area_key_size];
+    // Apply key derivation function to password
+    let mut password_key = vec![0; *keyslot_area_key_size];
     match &keyslot_kdf.type_data {
         KdfTypeData::Argon2i { time, memory, cpus } => {
             let params = argon2::Params::new(*memory, *time, *cpus, Some(*keyslot_area_key_size))?;
             let algorithm = argon2::Algorithm::Argon2i;
             let argon = argon2::Argon2::new(algorithm, argon2::Version::V0x13, params);
-            argon.hash_password_into(password, &keyslot_kdf.salt, &mut pw_hash)?;
+            argon.hash_password_into(password, &keyslot_kdf.salt, &mut password_key)?;
         }
         KdfTypeData::Argon2id { time, memory, cpus } => {
             let params = argon2::Params::new(*memory, *time, *cpus, Some(*keyslot_area_key_size))?;
             let algorithm = argon2::Algorithm::Argon2id;
             let argon = argon2::Argon2::new(algorithm, argon2::Version::V0x13, params);
-            argon.hash_password_into(password, &keyslot_kdf.salt, &mut pw_hash)?;
+            argon.hash_password_into(password, &keyslot_kdf.salt, &mut password_key)?;
         }
         KdfTypeData::Pbkdf2 { hash, iterations } => {
             let kdf_fn = match hash {
@@ -883,49 +889,60 @@ fn decrypt_keyslot(
                 Hash::Sha1 => pbkdf2::<Hmac<Sha1>>,
                 Hash::Unknown(h) => return Err(LuksError::UnsupportedPbkdf2Hash(h.clone())),
             };
-            kdf_fn(password, &keyslot_kdf.salt, *iterations, &mut pw_hash);
+            kdf_fn(password, &keyslot_kdf.salt, *iterations, &mut password_key);
         }
     }
 
-    // make pw_hash a secret after hashing
-    let pw_hash = Secret::new(pw_hash);
+    // Make password_key a secret after hashing
+    let password_key = Secret::new(password_key);
 
-    // decrypt keyslot area using the password hash as key
+    // Decrypt keyslot area using the password derived key
     match keyslot_area_encryption {
         Encryption::AesXtsPlain64 => match keyslot_area_key_size {
             32 => {
-                let key1 = Aes128::new_from_slice(&pw_hash.expose_secret()[..16]).unwrap();
-                let key2 = Aes128::new_from_slice(&pw_hash.expose_secret()[16..]).unwrap();
+                let key1 = Aes128::new_from_slice(&password_key.expose_secret()[..16]).unwrap();
+                let key2 = Aes128::new_from_slice(&password_key.expose_secret()[16..]).unwrap();
                 let xts = Xts128::<Aes128>::new(key1, key2);
-                xts.decrypt_area(&mut k, LUKS_SECTOR_SIZE, 0, get_tweak_default);
+                xts.decrypt_area(
+                    &mut master_key_split,
+                    LUKS_SECTOR_SIZE,
+                    0,
+                    get_tweak_default,
+                );
             }
             64 => {
-                let key1 = Aes256::new_from_slice(&pw_hash.expose_secret()[..32]).unwrap();
-                let key2 = Aes256::new_from_slice(&pw_hash.expose_secret()[32..]).unwrap();
+                let key1 = Aes256::new_from_slice(&password_key.expose_secret()[..32]).unwrap();
+                let key2 = Aes256::new_from_slice(&password_key.expose_secret()[32..]).unwrap();
                 let xts = Xts128::<Aes256>::new(key1, key2);
-                xts.decrypt_area(&mut k, LUKS_SECTOR_SIZE, 0, get_tweak_default);
+                xts.decrypt_area(
+                    &mut master_key_split,
+                    LUKS_SECTOR_SIZE,
+                    0,
+                    get_tweak_default,
+                );
             }
             x => return Err(LuksError::UnsupportedKeySize("aes-xts-plain64", *x)),
         },
         Encryption::Unknown(e) => return Err(LuksError::UnsupportedAreaEncryption(e.clone())),
     }
-    // make k a secret after decryption
-    let k = Secret::new(k);
-    // merge and hash master key
+    // Make master_key_split a secret after decryption
+    let master_key_split = Secret::new(master_key_split);
+    // Apply the AF merging to get the master key
     let master_key = match keyslot_af_hash {
         Hash::Sha256 => Secret::new(MasterKey(af::merge::<Sha256>(
-            &k.expose_secret(),
+            &master_key_split.expose_secret(),
             keyslot.key_size,
             keyslot_af_stripes.as_usize(),
         ))),
         Hash::Sha1 => Secret::new(MasterKey(af::merge::<Sha1>(
-            &k.expose_secret(),
+            &master_key_split.expose_secret(),
             keyslot.key_size,
             keyslot_af_stripes.as_usize(),
         ))),
         Hash::Unknown(h) => return Err(LuksError::UnsupportedAfHash(h.clone())),
     };
 
+    // Calculate master key digest
     let DigestTypeData::Pbkdf2 {
         hash: digest_hash,
         iterations: digest_iterations,
@@ -951,7 +968,7 @@ fn decrypt_keyslot(
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Header {
     bin: HeaderBin,
     json: HeaderJson,
@@ -1038,8 +1055,173 @@ impl Display for LuksDevice {
 
 impl LuksDevice {
     pub fn from_device(mut device: Box<dyn ReadWriteSeek>) -> Result<Self, LuksError> {
-        let header = Header::from_reader(&mut device)?;
+        let hdr_offset_expected = device.seek(SeekFrom::Start(0))?;
+        let primary_header = Header::from_reader(&mut device)?;
+        if primary_header.bin.hdr_offset != hdr_offset_expected {
+            return Err(LuksError::InvalidHeaderOffset {
+                expected: hdr_offset_expected,
+                found: primary_header.bin.hdr_offset,
+            });
+        }
+        let hdr_offset_expected = device.seek(SeekFrom::Current(0))?;
+        let secondary_header = Header::from_reader(&mut device)?;
+        if secondary_header.bin.hdr_offset != hdr_offset_expected {
+            return Err(LuksError::InvalidHeaderOffset {
+                expected: hdr_offset_expected,
+                found: primary_header.bin.hdr_offset,
+            });
+        }
+        let header = if primary_header.bin.seqid >= secondary_header.bin.seqid {
+            primary_header
+        } else {
+            secondary_header
+        };
         Ok(Self { device, header })
+    }
+
+    pub fn format_device(
+        mut device: Box<dyn ReadWriteSeek>,
+        password: &[u8],
+        sector_size: u16,
+    ) -> Result<Self, LuksError> {
+        let sector_size = SectorSize::from_u16(sector_size)?;
+        device.seek(SeekFrom::Current(0))?;
+        // Safeguard to avoid formatting a Luks device by mistake
+        let mut magic_buf = [0u8; MAGIC_LEN];
+        device.read_exact(&mut magic_buf)?;
+        let magic = Magic::from_byte_array(&magic_buf);
+        if magic == Some(Magic::First) {
+            return Err(LuksError::FoundExistingHeader);
+        }
+        device.seek(SeekFrom::Current(0))?;
+
+        // defaults:
+        let keyslot_area_key_size = 64;
+        let keyslot_key_size = 64;
+        let keyslot_af_stripes = Stripes {};
+        let digest_iterations = 1000;
+        // pbkdf defaults:
+        let hash = Hash::Sha256;
+        let time = 2000;
+        let memory = 1048576;
+        let cpus = 4;
+
+        let mut rng = StdRng::from_os_rng();
+
+        // Generate a master key from a CSPRNG
+        let master_key = {
+            let mut master_key = vec![0; keyslot_key_size];
+            rng.fill_bytes(&mut master_key);
+            Secret::new(MasterKey(master_key.to_vec()))
+        };
+
+        // Calculate master key digest
+        let mut digest_computed = vec![0; 32];
+        let digest_salt = {
+            let mut salt = vec![0; 32];
+            rng.fill_bytes(&mut salt);
+            salt
+        };
+        pbkdf2::<Hmac<Sha256>>(
+            &master_key.expose_secret().0,
+            &digest_salt,
+            digest_iterations,
+            &mut digest_computed,
+        );
+
+        // Apply key derivation function to password
+        let keyslot_kdf_salt = {
+            let mut salt = vec![0; 32];
+            rng.fill_bytes(&mut salt);
+            salt
+        };
+        let mut password_key = vec![0; keyslot_area_key_size];
+        let params = argon2::Params::new(memory, time, cpus, Some(keyslot_area_key_size))?;
+        let algorithm = argon2::Algorithm::Argon2id;
+        let argon = argon2::Argon2::new(algorithm, argon2::Version::V0x13, params);
+        argon.hash_password_into(password, &keyslot_kdf_salt, &mut password_key)?;
+        let password_key = Secret::new(password_key);
+
+        // Apply the AF splitting to the master key
+        let mut master_key_split = af::split::<Sha256>(
+            &master_key.expose_secret().0,
+            keyslot_key_size,
+            keyslot_af_stripes.as_usize(),
+        );
+
+        // Encrypt the master key split with the password derived key
+        let key1 = Aes256::new_from_slice(&password_key.expose_secret()[..32]).unwrap();
+        let key2 = Aes256::new_from_slice(&password_key.expose_secret()[32..]).unwrap();
+        let xts = Xts128::<Aes256>::new(key1, key2);
+        xts.encrypt_area(
+            &mut master_key_split,
+            LUKS_SECTOR_SIZE,
+            0,
+            get_tweak_default,
+        );
+
+        let keyslot_area_offset = todo!();
+        let keyslot_area_size = todo!();
+        let keyslot = Keyslot {
+            type_data: KeyslotTypeData::Luks2 {
+                kdf: Kdf {
+                    type_data: KdfTypeData::Argon2id { time, memory, cpus },
+                    salt: keyslot_kdf_salt,
+                },
+                af: Af::Luks1 {
+                    stripes: keyslot_af_stripes,
+                    hash,
+                },
+            },
+            key_size: keyslot_key_size,
+            area: Area {
+                type_data: AreaTypeData::Raw {
+                    encryption: Encryption::AesXtsPlain64,
+                    key_size: keyslot_area_key_size,
+                },
+                offset: keyslot_area_offset,
+                size: keyslot_area_size,
+            },
+            priority: None,
+        };
+
+        let segment_offset = todo!();
+        let segment = Segment {
+            type_data: SegmentTypeData::Crypt {
+                iv_tweak: 0,
+                encryption: Encryption::AesXtsPlain64,
+                sector_size,
+                integrity: None,
+            },
+            offset: segment_offset,
+            size: SegmentSize::Dynamic,
+            flags: vec![],
+        };
+
+        let uuid = Uuid::new_v4();
+
+        let salt_1: [u8; SALT_LEN] = rng.random();
+        let salt_2: [u8; SALT_LEN] = rng.random();
+        let header_bin = HeaderBin {
+            magic: Magic::First,
+            hdr_size: 0, // set it later
+            seqid: 1,
+            label: None,
+            checksum: Checksum::Sha256(Output::<Sha256>::default()), // set it later
+            salt: salt_1,
+            uuid: uuid.to_string(),
+            subsystem: None,
+            hdr_offset: 0, // set it later for secondary
+        };
+        let header_json = HeaderJson {
+            keyslots: vec![keyslot],
+            tokens: vec![],
+            segments: todo!(),
+            digests: todo!(),
+            config: todo!(),
+        };
+
+        todo!()
     }
 
     // tries to decrypt the master key with the given password by trying all available keyslots
