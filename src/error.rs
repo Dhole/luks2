@@ -147,4 +147,7 @@ pub enum LuksError {
         "Found existing header in device.  To format first clear the first segment of the device"
     )]
     FoundExistingHeader,
+
+    #[error("Not enough space for LUKS.  Disk is {0} bytes, need >= 16 MiB")]
+    NotEnoughSpace(u64),
 }

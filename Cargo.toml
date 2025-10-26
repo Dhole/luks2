@@ -42,7 +42,7 @@ pretty_assertions = "1.4.1"
 
 [features]
 default = ["std"]
-std = ["bincode/std", "serde/std", "serde_json/std", "acid_io/std", "xts-mode/std", "crossterm", "base64/std", "argon2/std"]
+std = ["bincode/std", "serde/std", "serde_json/std", "acid_io/std", "xts-mode/std", "crossterm", "base64/std", "argon2/std", "argon2/parallel"]
 
 [target.'cfg(windows)'.dev-dependencies]
 windows-drives = "0.5"

@@ -58,6 +58,7 @@ pub const SALT_LEN: usize = 64;
 pub const CSUM_ALG_LEN: usize = 32;
 pub const CSUM_LEN: usize = 64;
 pub const LUKS_BIN_HEADER_LEN: usize = 4096;
+pub const LUKS_HEADER_LEN: usize = 16 * 1024 * 1024;
 
 /// Pairs of secondary header offset VS JSON area size
 pub(crate) const PRIMARY_LEN_JSON_LEN: &[(usize, usize)] = &[
@@ -412,7 +413,7 @@ impl<'de> Deserialize<'de> for Hash {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Stripes {}
 
 impl Stripes {
@@ -550,7 +551,6 @@ pub enum KeyslotTypeData {
 ///
 /// Only the `luks2` type is currently used.
 #[derive(Debug, Clone, Deserialize, PartialEq, Serialize)]
-#[serde(tag = "type")]
 // enum variant names must match the JSON values exactly, which are lowercase, so no CamelCase names
 #[serde(rename_all = "snake_case")]
 pub struct Keyslot {
@@ -1093,6 +1093,11 @@ impl LuksDevice {
         if magic == Some(Magic::First) {
             return Err(LuksError::FoundExistingHeader);
         }
+        // Safeguard to allow enough space for a 16 MiB header
+        let device_size = device.seek(SeekFrom::End(0))?;
+        if device_size <= LUKS_HEADER_LEN as u64 {
+            return Err(LuksError::NotEnoughSpace(device_size));
+        }
         device.seek(SeekFrom::Current(0))?;
 
         // defaults:
@@ -1102,7 +1107,7 @@ impl LuksDevice {
         let digest_iterations = 1000;
         // pbkdf defaults:
         let hash = Hash::Sha256;
-        let time = 2000;
+        let time = 4;
         let memory = 1048576;
         let cpus = 4;
 
@@ -1116,7 +1121,7 @@ impl LuksDevice {
         };
 
         // Calculate master key digest
-        let mut digest_computed = vec![0; 32];
+        let mut master_key_digest = vec![0; 32];
         let digest_salt = {
             let mut salt = vec![0; 32];
             rng.fill_bytes(&mut salt);
@@ -1126,7 +1131,7 @@ impl LuksDevice {
             &master_key.expose_secret().0,
             &digest_salt,
             digest_iterations,
-            &mut digest_computed,
+            &mut master_key_digest,
         );
 
         // Apply key derivation function to password
@@ -1160,8 +1165,17 @@ impl LuksDevice {
             get_tweak_default,
         );
 
-        let keyslot_area_offset = todo!();
-        let keyslot_area_size = todo!();
+        let digest = Digest {
+            type_data: DigestTypeData::Pbkdf2 {
+                hash: hash.clone(),
+                iterations: digest_iterations,
+            },
+            keyslots: vec![Index(0)],
+            segments: vec![Index(0)],
+            salt: digest_salt,
+            digest: master_key_digest,
+        };
+
         let keyslot = Keyslot {
             type_data: KeyslotTypeData::Luks2 {
                 kdf: Kdf {
@@ -1179,13 +1193,14 @@ impl LuksDevice {
                     encryption: Encryption::AesXtsPlain64,
                     key_size: keyslot_area_key_size,
                 },
-                offset: keyslot_area_offset,
-                size: keyslot_area_size,
+                offset: u64::MAX, // set it later
+                size: (keyslot_af_stripes.as_usize() * keyslot_key_size).next_multiple_of(4096)
+                    as u64,
             },
             priority: None,
         };
 
-        let segment_offset = todo!();
+        let segment_offset = LUKS_HEADER_LEN as u64;
         let segment = Segment {
             type_data: SegmentTypeData::Crypt {
                 iv_tweak: 0,
@@ -1198,30 +1213,97 @@ impl LuksDevice {
             flags: vec![],
         };
 
+        let config = Config {
+            json_size: u64::MAX,     // set it later
+            keyslots_size: u64::MAX, // set it later
+            flags: None,
+            requirements: None,
+        };
+
+        let mut header_json = HeaderJson {
+            keyslots: vec![keyslot],
+            tokens: vec![],
+            segments: vec![segment],
+            digests: vec![digest],
+            config,
+        };
+
+        let json_size = {
+            let buf = serde_json::to_vec(&header_json).expect("serialize");
+            PRIMARY_LEN_JSON_LEN
+                .iter()
+                .find_map(|(_, json_size)| (buf.len() < *json_size).then_some(*json_size))
+                .expect("size found") as u64
+        };
+
+        let keyslot_area_offset = 2 * (LUKS_BIN_HEADER_LEN as u64 + json_size);
+        let keyslots_size = LUKS_HEADER_LEN as u64 - 2 * (LUKS_BIN_HEADER_LEN as u64 + json_size);
+        header_json.config.json_size = json_size;
+        header_json.config.keyslots_size = keyslots_size;
+        header_json.keyslots[0].area.offset = keyslot_area_offset;
+
         let uuid = Uuid::new_v4();
 
         let salt_1: [u8; SALT_LEN] = rng.random();
         let salt_2: [u8; SALT_LEN] = rng.random();
-        let header_bin = HeaderBin {
-            magic: Magic::First,
-            hdr_size: 0, // set it later
+        let header_size = LUKS_BIN_HEADER_LEN as u64 + json_size;
+        let mut header_bin = HeaderBin {
+            magic: Magic::First, // set it later
+            hdr_size: header_size,
             seqid: 1,
             label: None,
             checksum: Checksum::Sha256(Output::<Sha256>::default()), // set it later
-            salt: salt_1,
+            salt: [0; SALT_LEN],                                     // set it later
             uuid: uuid.to_string(),
             subsystem: None,
-            hdr_offset: 0, // set it later for secondary
-        };
-        let header_json = HeaderJson {
-            keyslots: vec![keyslot],
-            tokens: vec![],
-            segments: todo!(),
-            digests: todo!(),
-            config: todo!(),
+            hdr_offset: u64::MAX, // set it later
         };
 
-        todo!()
+        // Write keyslot area
+        device.seek(SeekFrom::Start(keyslot_area_offset))?;
+        device.write_all(&master_key_split)?;
+        // Write JSON area 2 & 1
+        let mut json_header_bytes = Cursor::new(vec![0; json_size as usize]);
+        serde_json::to_writer(&mut json_header_bytes, &header_json).expect("serialize");
+        let json_area_bytes = json_header_bytes.into_inner();
+        device.seek(SeekFrom::Start(header_size + LUKS_BIN_HEADER_LEN as u64))?;
+        device.write_all(&json_area_bytes)?;
+        device.seek(SeekFrom::Start(LUKS_BIN_HEADER_LEN as u64))?;
+        device.write_all(&json_area_bytes)?;
+
+        fn write_header_bin(
+            device: &mut dyn ReadWriteSeek,
+            header_bin: &HeaderBin,
+            json_header_bytes: &[u8],
+        ) -> Result<(), LuksError> {
+            let mut header_bin_bytes = vec![0; LUKS_BIN_HEADER_LEN];
+            let header_checksum =
+                Header::calculate_checksum_generic::<Sha256>(&header_bin, json_header_bytes);
+            let mut header_bin = header_bin.clone();
+            header_bin.checksum = Checksum::Sha256(header_checksum);
+            device.seek(SeekFrom::Start(header_bin.hdr_offset))?;
+            BinHeaderRaw::try_from(&header_bin)
+                .expect("into-raw")
+                .write_slice(&mut header_bin_bytes)
+                .expect("encode");
+            device.write_all(&header_bin_bytes)?;
+            Ok(())
+        }
+
+        // Write Binary header 2 & 1
+        header_bin.magic = Magic::Second;
+        header_bin.salt = salt_2;
+        header_bin.hdr_offset = header_size;
+        write_header_bin(&mut device, &header_bin, &json_area_bytes)?;
+
+        header_bin.magic = Magic::First;
+        header_bin.salt = salt_1;
+        header_bin.hdr_offset = 0;
+        write_header_bin(&mut device, &header_bin, &json_area_bytes)?;
+
+        device.flush()?;
+
+        Self::from_device(device)
     }
 
     // tries to decrypt the master key with the given password by trying all available keyslots
