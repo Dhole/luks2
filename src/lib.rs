@@ -1085,7 +1085,7 @@ impl LuksDevice {
         sector_size: u16,
     ) -> Result<Self, LuksError> {
         let sector_size = SectorSize::from_u16(sector_size)?;
-        device.seek(SeekFrom::Current(0))?;
+        device.seek(SeekFrom::Start(0))?;
         // Safeguard to avoid formatting a Luks device by mistake
         let mut magic_buf = [0u8; MAGIC_LEN];
         device.read_exact(&mut magic_buf)?;
