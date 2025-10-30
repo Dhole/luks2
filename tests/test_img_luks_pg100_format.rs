@@ -18,6 +18,7 @@ fn test_format_device() {
         .read(true)
         .write(true)
         .truncate(true)
+        .create(true)
         .open(&path)
         .unwrap();
     let zeroes = vec![0; FILE_SIZE];
