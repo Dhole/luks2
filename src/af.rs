@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
 use digest::{Digest, FixedOutputReset};
+use rand::prelude::*;
 
 fn xor_block(src: &[u8], dst: &mut [u8], n: usize) {
     for j in 0..n {
@@ -50,4 +51,44 @@ where
     }
 
     bufblock
+}
+
+pub fn split<H>(src: &[u8], blocksize: usize, blocknumbers: usize) -> Vec<u8>
+where
+    H: Digest + FixedOutputReset,
+{
+    let mut bufblock = vec![0; blocksize];
+    let mut dst = vec![0; blocksize * blocknumbers];
+    let mut rng = StdRng::from_os_rng();
+
+    for i in 0..blocknumbers {
+        let s = blocksize * i;
+        let e = s + blocksize;
+        if i < (blocknumbers - 1) {
+            rng.fill_bytes(&mut dst[s..e]);
+            xor_block(&dst[s..e], &mut bufblock, blocksize);
+            diffuse::<H>(&mut bufblock, blocksize);
+        } else {
+            dst[s..e].copy_from_slice(&src);
+            xor_block(&bufblock, &mut dst[s..e], blocksize);
+        }
+    }
+
+    dst
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::Sha256;
+
+    #[test]
+    fn test_af() {
+        let key: Vec<u8> = (0..32).collect();
+        let blocksize = 32;
+        let blocknumbers = 4_000;
+        let key_split = split::<Sha256>(&key, blocksize, blocknumbers);
+        let key_merged = merge::<Sha256>(&key_split, blocksize, blocknumbers);
+        assert_eq!(key, key_merged);
+    }
 }

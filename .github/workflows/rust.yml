@@ -40,3 +40,9 @@ jobs:
         cargo test --test test_img_luks_pg100_write test_read_device
         ./decrypt-test-luks-write.sh
         cargo test --test test_img_luks_pg100_write test_verify_decryption
+    - name: Test img-luks-pg100-format
+      run: |
+        cd test-data
+        RUSTFLAGS="-C target-feature=+aes" cargo  test --release --test test_img_luks_pg100_format test_format_device
+        ./encrypt-test-luks-format.sh
+        RUSTFLAGS="-C target-feature=+aes" cargo  test --release --test test_img_luks_pg100_format test_read_device

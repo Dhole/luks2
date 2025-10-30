@@ -8,6 +8,8 @@ use std::{
     io::{Read, Seek, SeekFrom, Write},
 };
 
+const SIZE: usize = 4 * 1024 * 1024;
+
 fn open_test_img() -> Box<File> {
     let path_src = format!(
         "{}/test-data/test-luks-blank.img",
@@ -39,7 +41,7 @@ fn test_write_device() {
     let mut pg100 = File::open(&pg100_path).unwrap();
     let mut pg100_buf = Vec::new();
     pg100.read_to_end(&mut pg100_buf).unwrap();
-    pg100_buf.truncate(4 * 1024 * 1024);
+    pg100_buf.truncate(SIZE);
     let mut pg100 = Cursor::new(pg100_buf);
 
     let f = open_test_img();
@@ -49,7 +51,7 @@ fn test_write_device() {
         .unwrap();
 
     // write `d` with zeroes until the end
-    let out = vec![0; 4 * 1024 * 1024];
+    let out = vec![0; SIZE];
     d.write_all(&out).unwrap();
     println!("write_all done");
     d.seek(SeekFrom::Start(0)).unwrap();
@@ -104,8 +106,8 @@ fn test_read_device() {
         .activate(true, b"password")
         .unwrap();
 
-    let mut decrypted_buf = vec![0; 4 * 1024 * 1024];
-    d.read_exact(&mut decrypted_buf).unwrap();
+    let mut decrypted_buf = Vec::new();
+    d.read_to_end(&mut decrypted_buf).unwrap();
 
     assert_eq!(expected_buf, decrypted_buf);
 }

@@ -56,3 +56,18 @@ data with the expected content.
 Then we decrypt the entire luks segment from the VM and write the output to a file.
 
 Finally in Rust we compare the VM decrypted content with the expected content.
+
+## luks-pg100-format
+
+Steps:
+```
+RUSTFLAGS="-C target-feature=+aes" cargo  test --release --test test_img_luks_pg100_format test_format_device
+./encrypt-test-luks-format.sh
+RUSTFLAGS="-C target-feature=+aes" cargo  test --release --test test_img_luks_pg100_format test_read_device
+```
+
+The first rust test will create a new file and format it as a Luks device with a single keyslot.
+
+Then the script will mount the luks device and write from the `pg100.tx` into it.
+
+Finally in Rust we actiavte decrypt the content and compare it against the expected content.
