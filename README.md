@@ -3,7 +3,7 @@
 
 Original: https://sr.ht/~mvforell/luks2/
 
-Interact with (currently: read metadata and data from) LUKS2 partitions from Rust.
+Interact with (read, write and format) LUKS2 partitions from Rust.
 
 Build with `RUSTFLAGS="-C target-feature=+aes"` to use the AES processor instruction set (if
 available on your platform).
@@ -27,6 +27,7 @@ From https://github.com/oberien/luks2
 From https://github.com/Dhole/luks2
 * rewrite the types to make it easier for encoding and serialization
 * fix some bugs
-* probably add some bugs as well
-* implement header checksum verification
+* add header checksum verification
 * add a testing framework to validate the implementation against the cryptsetup implementation
+* add write mode
+* add format new luks device
